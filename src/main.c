@@ -322,6 +322,13 @@ static int game_main(void)
     /* The executor's off-screen batch cull (an NFSU2 speed-up) dropped draws
      * in Burnout 3; off until checked on this title. */
     setenv("RECOMP_CULL", "0", 0);
+    /* FMOD's mixbins with the DSP stubbed (apu_dsp.c): effects (6/7) at
+     * -6 dB, the reverb send (10) not mixed dry, rear 3D bins folded in. */
+    /* FlatOut 2 draws the same 4:3 frame whatever the video flags say (the
+     * title screen is identical with and without widescreen), so stretching
+     * it to 16:9 only widens everything: present 4:3, full height. */
+    setenv("RECOMP_WIDESCREEN", "0", 0);
+    setenv("RECOMP_APU_DOWNMIX", "6:0.5:0,7:0:0.5,8:0.35:0,9:0:0.35,10:0:0", 0);
 #endif
 #if defined(__SWITCH__)
     /* Every periodic log line flushes to the SD card; keep the log to what

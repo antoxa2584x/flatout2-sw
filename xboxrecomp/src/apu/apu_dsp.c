@@ -112,6 +112,30 @@ static void downmix_init(void)
     s_downmix[2][0] = s_downmix[2][1] = DM_M3DB;    /* front centre */
     s_downmix[3][0] = s_downmix[3][1] = DM_M3DB;    /* LFE */
     s_downmix[10][0] = s_downmix[10][1] = DM_M3DB;  /* I3DL2 reverb send */
+    /* RECOMP_APU_DOWNMIX="bin:left:right,...": a title's own gains. With
+     * the GP/EP stubbed nothing applies what the title's DSP image would to
+     * its bins. FlatOut 2 (FMOD, fmodfx.bin) sends every effect to 6/7 and
+     * the same signal at half level to the reverb send 10; mixed dry, the
+     * race sum went past full scale and the tanh below crushed it. */
+    {
+        const char *e = getenv("RECOMP_APU_DOWNMIX");
+        while (e && *e) {
+            char *end;
+            int b = (int)strtol(e, &end, 10);
+            float l, r;
+            if (end == e || *end != ':') break;
+            l = strtof(end + 1, &end);
+            if (*end != ':') break;
+            r = strtof(end + 1, &end);
+            if (b >= 0 && b < NUM_MIXBINS) {
+                s_downmix[b][0] = l;
+                s_downmix[b][1] = r;
+            }
+            e = *end == ',' ? end + 1 : NULL;
+        }
+        if (getenv("RECOMP_APU_DOWNMIX"))
+            fprintf(stderr, "[APU] downmix: %s\n", getenv("RECOMP_APU_DOWNMIX"));
+    }
 }
 
 static void dsp_ack_frame(MCPXAPUState *d)
@@ -157,6 +181,38 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     /* In the real xemu, this reads settings to decide whether
      * GP/EP should run in realtime or cached mode. We ignore it. */
     (void)d;
+}
+
+/* RECOMP_APU_BIN_STATS=1: RMS and peak of each mixbin every 5 s of audio
+ * (which bins a title's voices land in, and how loud each is). */
+static void bin_stats(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int i)
+{
+    static int on = -1;
+    static double sq[NUM_MIXBINS];
+    static float pk[NUM_MIXBINS];
+    static unsigned n;
+    int b;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_BIN_STATS");
+        on = e && *e == '1';
+    }
+    if (!on)
+        return;
+    for (b = 0; b < NUM_MIXBINS; b++) {
+        float v = mixbins[b][i];
+        sq[b] += (double)v * v;
+        if (fabsf(v) > pk[b]) pk[b] = fabsf(v);
+    }
+    if (++n >= 48000u * 5) {
+        fprintf(stderr, "[APU-BINS]");
+        for (b = 0; b < NUM_MIXBINS; b++)
+            if (pk[b] > 0.0f)
+                fprintf(stderr, " %d:%.3f/%.2f", b, sqrt(sq[b] / n), pk[b]);
+        fprintf(stderr, "\n");
+        memset(sq, 0, sizeof sq);
+        memset(pk, 0, sizeof pk);
+        n = 0;
+    }
 }
 
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
@@ -211,6 +267,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * (s_downmix). This is not what a real EP does; it is the cheapest
              * mixdown that stops discarding audio. */
             float left, right;
+            bin_stats(mixbins, i);
             if (mcpx_apu_mixdown_all()) {
                 left = 0.0f;
                 right = 0.0f;

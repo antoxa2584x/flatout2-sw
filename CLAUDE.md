@@ -7,7 +7,8 @@ and built for Linux and Nintendo Switch (libnx NRO, Vulkan). Started
 the library hooks taken from NFS Carbon (`..\nfsc-xbox`): FlatOut 2 links the
 same non-LTCG D3D8/DSOUND/XPP/CRT 5849 code as Carbon, byte for byte apart
 from relocations. Read `..\nfsu2-xbox\CLAUDE.md` for everything the runtime
-does on Horizon. No git repo or remote yet.
+does on Horizon. Repo: git@github.com:antoxa2584x/flatout2-sw.git (`main`,
+commits as `Anton Artemov <antoxa2584@gmail.com>`).
 
 ## Rules
 
@@ -79,6 +80,24 @@ does on Horizon. No git repo or remote yet.
   (fast log2 at 0x15AA70).
 - **Teal car shadows (toolkit nv2a_vk vk_clear):** the shadow target is
   R5G6B5, cleared to 0xFFFF; the clear value is in the surface's format.
+- **Distorted sound in races (src/main.c RECOMP_APU_DOWNMIX, toolkit
+  apu_dsp.c):** FMOD loads its own GP DSP image (Data/Sound/fmodfx.bin);
+  the runtime's DSP is a passthrough that sums mixbins to stereo. Race
+  effects go to bins 6/7 (RMS ~0.28) plus the same signal at half level to
+  the reverb send 10; music to 0/1 (RMS ~0.04). Summed dry, the console mix
+  hit full scale (peak 32739 in [perf] audio out) and the final tanh
+  crushed it. FlatOut 2's gains: 6/7 x0.5, 8/9 x0.35, 10 off.
+  `RECOMP_APU_BIN_STATS=1` prints per-bin RMS/peak every 5 s.
+- **Aspect:** the title draws the same 4:3 frame with or without the
+  widescreen flag, so main.c sets RECOMP_WIDESCREEN=0 (4:3, full height);
+  stretching to 16:9 widened everything.
+- **Switch profiles (src/switch_nx.c):** clocks boosted while docked only
+  (CPU 1785 / GPU 768 / memory 1600 MHz; FO2_DOCK_BOOST=0 off, NFSU2_*_MHZ
+  in fo2x_env.txt = always those); render scale per mode from
+  sdmc:/switch/fo2x/fo2x_options.txt (scale_docked=200, scale_handheld=150,
+  aniso=16, fxaa=1; RECOMP_GL_SCALE overrides). Logged as [options]/[mode].
+- Shader/pipeline caches on the Switch were read from sdmc:/switch/b3x/
+  (hard-coded in the toolkit); now sdmc:/switch/fo2x/.
 - Debug aids added: FRAME_TRACE prints texture formats/control0 per stage;
   `RECOMP_VK_SKIP_BLEND=<hex dfactor>` drops blended draws with that factor.
 

@@ -1017,6 +1017,79 @@ static void clk_hook(AppletHookType hook, void *param)
         ueventSignal(&s_clk_wake);
 }
 
+/* ── Docked / handheld profiles ───────────────────────────────────
+ *
+ * Without NFSU2_*_MHZ in fo2x_env.txt the clocks are boosted while docked
+ * only (CPU 1785, GPU 768 = the docked GPU clock, memory 1600 MHz;
+ * FO2_DOCK_BOOST=0 turns that off): on the dock there is no battery to
+ * spare, and the game thread is what limits the frame rate. Handheld keeps
+ * the system's clocks (the system resets them itself on undock).
+ *
+ * The picture follows the mode too, from sdmc:/switch/fo2x/fo2x_options.txt
+ * (KEY=VALUE, all optional):
+ *   scale_docked=200     render scale in % (640x480 x2 = 1280x960 for 1080p)
+ *   scale_handheld=150   (x1.5 = 720 lines, the handheld panel)
+ *   aniso=16             anisotropic filtering 1/2/4/8/16
+ *   fxaa=1               FXAA on the presented frame
+ * RECOMP_GL_SCALE in fo2x_env.txt, when set, overrides both scales. */
+#define FO2_OPTIONS_FILE "sdmc:/switch/fo2x/fo2x_options.txt"
+static int s_dock_only;                    /* clocks set while docked only */
+static int s_scale_docked = 200, s_scale_handheld = 150, s_scale_env;
+#ifdef NFSU2_VULKAN
+extern volatile int nv2a_vk_scale_pct, nv2a_vk_fxaa, nv2a_vk_aniso;
+#endif
+
+static void options_load(void)
+{
+    FILE *f = fopen(FO2_OPTIONS_FILE, "r");
+    char line[96];
+    int fxaa = 1, aniso = 16;
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (!strncmp(line, "scale_docked=", 13)) s_scale_docked = atoi(line + 13);
+            else if (!strncmp(line, "scale_handheld=", 15)) s_scale_handheld = atoi(line + 15);
+            else if (!strncmp(line, "aniso=", 6)) aniso = atoi(line + 6);
+            else if (!strncmp(line, "fxaa=", 5)) fxaa = atoi(line + 5) != 0;
+        }
+        fclose(f);
+    }
+    if (s_scale_docked < 50 || s_scale_docked > 400) s_scale_docked = 200;
+    if (s_scale_handheld < 50 || s_scale_handheld > 400) s_scale_handheld = 150;
+    if (aniso < 1) aniso = 1;
+    if (aniso > 16) aniso = 16;
+    s_scale_env = getenv("RECOMP_GL_SCALE") && *getenv("RECOMP_GL_SCALE");
+#ifdef NFSU2_VULKAN
+    nv2a_vk_fxaa = fxaa;
+    nv2a_vk_aniso = aniso;
+#endif
+    printf("[options] scale docked %d%% handheld %d%%%s, anisotropic %dx, FXAA %s\n",
+           s_scale_docked, s_scale_handheld, s_scale_env ? " (RECOMP_GL_SCALE wins)" : "",
+           aniso, fxaa ? "on" : "off");
+}
+
+static int is_docked(void)
+{
+    return appletGetOperationMode() == AppletOperationMode_Console;
+}
+
+/* The render scale for the current mode (applied by the renderer at the next
+ * flip, surfaces rescaled with their pixels). */
+static void mode_apply(void)
+{
+    static int last = -1;
+    int docked = is_docked();
+    if (docked == last)
+        return;
+    last = docked;
+#ifdef NFSU2_VULKAN
+    if (!s_scale_env)
+        nv2a_vk_scale_pct = docked ? s_scale_docked : s_scale_handheld;
+#endif
+    printf("[mode] %s: render scale %d%%%s\n", docked ? "docked" : "handheld",
+           docked ? s_scale_docked : s_scale_handheld,
+           s_dock_only ? (docked ? ", clocks boosted" : ", system clocks") : "");
+}
+
 static void clk_keeper(void *arg)
 {
     unsigned logged = 0, fast = 0;
@@ -1027,8 +1100,11 @@ static void clk_keeper(void *arg)
             fast = 20;
         else if (fast)
             fast--;
+        mode_apply();
         if (s_clk_stop || appletGetFocusState() != AppletFocusState_InFocus)
             continue;
+        if (s_dock_only && !is_docked())
+            continue;                       /* handheld: the system's clocks */
         for (int i = 0; i < 3; i++) {
             u32 hz = 0;
             if (!s_clk[i].set_hz || R_FAILED(clk_get(i, &hz)) || hz == s_clk[i].set_hz)
@@ -1041,9 +1117,23 @@ static void clk_keeper(void *arg)
     }
 }
 
+static void clk_start_keeper(void)
+{
+    ueventCreate(&s_clk_wake, true);
+    appletHook(&s_clk_hook, clk_hook, NULL);
+    if (R_SUCCEEDED(threadCreate(&s_clk_thread, clk_keeper, NULL, NULL, 0x4000, 0x2C, -2))
+        && R_SUCCEEDED(threadStart(&s_clk_thread)))
+        s_clk_thread_up = 1;
+}
+
 static void clk_apply(void)
 {
+    static const double boost_mhz[3] = { 1785, 768, 1600 };
     int i, any = 0;
+    const char *db = getenv("FO2_DOCK_BOOST");
+
+    options_load();
+    mode_apply();
     for (i = 0; i < 3; i++) {
         const char *e = getenv(s_clk[i].env);
         double mhz = e ? atof(e) : 0;
@@ -1052,14 +1142,23 @@ static void clk_apply(void)
             s_clk[i].want_hz = s_clk[i].cap_hz;
         any |= s_clk[i].want_hz != 0;
     }
-    if (!any)
-        return;
-    if (hosversionAtLeast(8, 0, 0) && R_SUCCEEDED(clkrstInitialize()))
-        s_clk_rst = 1;
-    else if (R_SUCCEEDED(pcvInitialize()))
-        s_clk_rst = 0;
-    else {
-        printf("[clock] neither clkrst nor pcv is available: clocks unchanged\n");
+    if (!any && !(db && *db == '0')) {
+        for (i = 0; i < 3; i++)
+            s_clk[i].want_hz = (u32)(boost_mhz[i] * 1e6);
+        s_dock_only = any = 1;
+    }
+    if (any) {
+        if (hosversionAtLeast(8, 0, 0) && R_SUCCEEDED(clkrstInitialize()))
+            s_clk_rst = 1;
+        else if (R_SUCCEEDED(pcvInitialize()))
+            s_clk_rst = 0;
+        else {
+            printf("[clock] neither clkrst nor pcv is available: clocks unchanged\n");
+            any = 0;
+        }
+    }
+    if (!any) {
+        clk_start_keeper();                 /* still follows dock/undock for the scale */
         return;
     }
     for (i = 0; i < 3; i++) {
@@ -1076,6 +1175,12 @@ static void clk_apply(void)
         }
         clk_get(i, &s_clk[i].old_hz);
         hz = clk_pick(i, s_clk[i].want_hz);
+        if (s_dock_only && !is_docked()) {
+            s_clk[i].set_hz = hz;           /* the keeper sets it once docked */
+            printf("[clock] %s %u MHz now, %u MHz when docked\n", s_clk[i].name,
+                   s_clk[i].old_hz / 1000000u, hz / 1000000u);
+            continue;
+        }
         rc = clk_set(i, hz);
         clk_get(i, &now);
         if (R_SUCCEEDED(rc))
@@ -1085,11 +1190,7 @@ static void clk_apply(void)
                R_FAILED(rc) ? " -- refused" : "");
     }
     atexit(clk_restore);
-    ueventCreate(&s_clk_wake, true);
-    appletHook(&s_clk_hook, clk_hook, NULL);
-    if (R_SUCCEEDED(threadCreate(&s_clk_thread, clk_keeper, NULL, NULL, 0x4000, 0x2C, -2))
-        && R_SUCCEEDED(threadStart(&s_clk_thread)))
-        s_clk_thread_up = 1;
+    clk_start_keeper();
 }
 
 void switch_boot(void)
