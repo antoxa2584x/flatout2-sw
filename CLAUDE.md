@@ -119,6 +119,32 @@ commits as `Anton Artemov <antoxa2584@gmail.com>`).
   __aarch64_read_tp 4% (TLS guest registers). FPS 20-30 = missing the
   2-vblank deadline. Profiling: RECOMP_NX_PROFILE=1 -> prof.bin;
   tools/prof_report.py prof.bin <the NRO's elf> log; ELFs in /root/fo2x/elf/.
+- **Switch CPU work (2026-10-13, after the console profile):**
+  - *Spin waits sleep (toolkit):* RECOMP_SPIN_HINT used to wake the
+    register threads every 16 turns and hand the guest lock over every 64
+    (a quarter of the game thread in futex calls while it waited on the GPU
+    fence). Now every 64 turns: one wake, then sleep (lock released) until
+    recomp_hw_progress (after each pushbuffer scan, each vblank) or
+    RECOMP_SPIN_SLEEP_US (250; 0 = old yield). Linux race: game thread from
+    ~100% of a core to ~14%, same fps.
+  - *Register file (toolkit):* g_eax ... g_mm7 are fields of one TLS struct
+    (include/xbox/recomp_regs.h, `_rr`); every lifted function opens with
+    RECOMP_RR_DECL (a local `_rr` pointer, opaque through an empty asm so GCC
+    keeps it in a register). devkitA64 reads TLS via a call
+    (__aarch64_read_tp), which lifted code repeated after every guest call;
+    now once per function. The leaf/x87 "locals" modes name their locals
+    L_* and #define the g_* names to them for the body.
+  - *No tiled fold per access:* CMake RECOMP_FOLD_TILED=0. XMV joins the
+    device-aware sections; mmio_rewrite folds MMX_MEM/XMM_MEM/*_STORE/
+    XMM_LOAD_* addresses too; the native XMV converter folds its surface.
+    Checked with RECOMP_NO_TILED=1 (Linux leaves the aperture unmapped):
+    movies, menus, a race.
+  - Result: NRO 52.2 -> 37.6 MB; hot collision/physics functions 20-50%
+    less code (sub_001D93F0 46 -> 34 KB). Non-volatile guest memory
+    (-DRECOMP_MEM_VOLATILE=) would only save another 2-3%: left on.
+  - Collision/physics (sub_0007E6E0 chain: box-box sub_001D93F0,
+    sub_001DA450, sub_001C9BB0/...) are large routines with 20 KB frames,
+    not small leaves; no single one is worth a native rewrite yet.
 - Main menu is data/scripts/MainMenu.bed in flatout2.bfs (bfs1 v0x20040505,
   24-byte entries, encoded names) -- for hiding the Xbox Live item later.
 - Debug aids added: FRAME_TRACE prints texture formats/control0 per stage;

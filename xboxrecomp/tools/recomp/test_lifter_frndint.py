@@ -88,6 +88,7 @@ int main(void) {
             built = subprocess.run(
                 [cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
                  "-I", str(_ROOT / "templates" / "runtime"),
+                 "-I", str(_ROOT / "include"),
                  str(src), "-o", str(exe)]
                     + ([] if os.name == "nt" else ["-lm"]),
                 capture_output=True, text=True)

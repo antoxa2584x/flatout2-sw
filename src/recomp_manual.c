@@ -496,6 +496,13 @@ static void xmv_yuv_native(void)
     uint32_t ypitch = MEM32(a + 12), uvpitch = MEM32(a + 16);
     uint32_t dst = MEM32(a + 20), dpitch = MEM32(a + 24);
     uint32_t n;
+    /* The XMV player hands the movie surface in the tiled aperture
+     * (0xF0000000 | physical). This is not lifted device-aware, and the
+     * Switch build does not fold every access (RECOMP_FOLD_TILED=0), so the
+     * addresses are folded onto the contiguous window here. */
+#define FO2_FOLD(x) ((x) - 0xF0000000u < 0x08000000u ? (0x80000000u | ((x) & 0x03FFFFFFu)) : (x))
+    dst = FO2_FOLD(dst); ys = FO2_FOLD(ys); us = FO2_FOLD(us); vs = FO2_FOLD(vs);
+#undef FO2_FOLD
     XmvCoef k = { mm4, mm5, mm7, xmm4, xmm5, xmm6, xmm7 };
     RecompMmx m6 = mm6, r0 = mm0, r1 = mm1, r2 = mm2, r3 = mm3, u, v;
     RecompXmm x0 = xmm0, x1 = xmm1, x2 = xmm2, x3 = xmm3;

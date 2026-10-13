@@ -164,20 +164,20 @@ extern uint32_t g_xbox_code_hi;
 #  define RECOMP_TLS _Thread_local
 #endif
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+/* The register file (g_eax ... g_mm7): fields of one thread-local struct,
+ * reached through a per-function pointer in lifted code (recomp_regs.h). */
+#include <xbox/recomp_regs.h>
 
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS int g_fp_top;
 
 /* A function whose x87 top index lives in a local (the translator's
  * _localize_x87_stack) takes this thread's stack once, and loads and stores
  * the index around everything that can run other lifted code. */
-static inline double *recomp_fp_base(void) { return g_fp_stack; }
-static inline int recomp_fp_top_ld(void) { return g_fp_top; }
-static inline void recomp_fp_top_st(int top) { g_fp_top = top; }
+/* Macros: expanded in the lifted function, through its own _rr. */
+#define recomp_fp_base() (_rr->r_fp_stack)
+#define recomp_fp_top_ld() (_rr->r_fp_top)
+#define recomp_fp_top_st(top) ((void)(_rr->r_fp_top = (top)))
 
 /**
  * SEH frame pointer bridge.
@@ -195,10 +195,8 @@ static inline void recomp_fp_top_st(int top) { g_fp_top = top; }
  * Per-thread, because a TIB is. fs:[0] is the SEH chain head and fs:[4]
  * reaches the CRT's per-thread data, so a single shared base makes every
  * guest thread the same thread as far as the CRT is concerned. */
-extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE g_fs_base
 
-extern RECOMP_TLS uint32_t g_seh_ebp;
 
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *
@@ -291,6 +289,7 @@ void recomp_preempt(void);
 #include <sched.h>
 void recomp_spin_wake(void);        /* runtime: wake the hardware threads */
 void recomp_spin_yield(void);       /* runtime: yield, and the guest lock with it */
+void recomp_spin_block(void);       /* runtime: wake the hardware, sleep until it moves */
 /* At every lifted function entry: yield if another guest thread has been
  * waiting for the guest lock (kernel_bridge.c). One load when nobody is. */
 extern volatile int g_gil_contended;
@@ -304,10 +303,8 @@ static inline void recomp_spin_hint(void)
 #elif defined(__x86_64__) || defined(__i386__)
     __builtin_ia32_pause();
 #endif
-    if ((++turns & 15u) == 0)
-        recomp_spin_wake();         /* someone is waiting: answer now */
-    if ((turns & 63u) == 0)
-        recomp_spin_yield();        /* lets other guest threads and ISRs run */
+    if ((++turns & 63u) == 0)
+        recomp_spin_block();        /* wake the hardware, sleep until it moves */
 }
 #define RECOMP_SPIN_HINT() recomp_spin_hint()
 #endif
@@ -315,7 +312,6 @@ static inline void recomp_spin_hint(void)
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
-extern RECOMP_TLS uint32_t g_ebp;
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
  *
@@ -329,16 +325,12 @@ extern RECOMP_TLS uint32_t g_ebp;
  * be found by name, and the dashboard rebooted rather than showing a UI.
  * memmove's overlapping case is the same instruction and the same bug.
  */
-extern RECOMP_TLS int g_df;
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
-extern RECOMP_TLS uint16_t g_fp_control_word;
-extern RECOMP_TLS int g_fp_cmp;
-extern RECOMP_TLS uint16_t g_fp_cc;
 /* x87 precision control (control word bits 8-9). The stack is double-backed,
  * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
  * Xbox runs with -- rounds every arithmetic result to float. A title that
@@ -619,8 +611,6 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
-extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 
 /* -- construction -- */
 
@@ -1279,24 +1269,42 @@ typedef union RecompMmx {
 } RecompMmx;
 #endif
 
-extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 
 /* Loads and stores for a leaf function that keeps registers in C locals
  * (translator.py, _localize_leaf_registers). The locals shadow the globals
  * by name, so the function reaches the real register only through these. */
-#define RECOMP_LEAF_REG(T, R)                                               \
-    static inline T recomp_leaf_ld_##R(void) { return g_##R; }              \
-    static inline void recomp_leaf_st_##R(T v) { g_##R = v; }
-RECOMP_LEAF_REG(uint32_t, eax) RECOMP_LEAF_REG(uint32_t, ecx)
-RECOMP_LEAF_REG(uint32_t, edx) RECOMP_LEAF_REG(uint32_t, ebx)
-RECOMP_LEAF_REG(uint32_t, esi) RECOMP_LEAF_REG(uint32_t, edi)
-RECOMP_LEAF_REG(uint32_t, esp)
-RECOMP_LEAF_REG(RecompMmx, mm0) RECOMP_LEAF_REG(RecompMmx, mm1)
-RECOMP_LEAF_REG(RecompMmx, mm2) RECOMP_LEAF_REG(RecompMmx, mm3)
-RECOMP_LEAF_REG(RecompMmx, mm4) RECOMP_LEAF_REG(RecompMmx, mm5)
-RECOMP_LEAF_REG(RecompMmx, mm6) RECOMP_LEAF_REG(RecompMmx, mm7)
-#undef RECOMP_LEAF_REG
+/* Macros, not functions: they expand where they are used, so a lifted
+ * function reaches the struct through its own _rr pointer. */
+#define recomp_leaf_ld_eax() (_rr->r_eax)
+#define recomp_leaf_st_eax(v) ((void)(_rr->r_eax = (v)))
+#define recomp_leaf_ld_ecx() (_rr->r_ecx)
+#define recomp_leaf_st_ecx(v) ((void)(_rr->r_ecx = (v)))
+#define recomp_leaf_ld_edx() (_rr->r_edx)
+#define recomp_leaf_st_edx(v) ((void)(_rr->r_edx = (v)))
+#define recomp_leaf_ld_ebx() (_rr->r_ebx)
+#define recomp_leaf_st_ebx(v) ((void)(_rr->r_ebx = (v)))
+#define recomp_leaf_ld_esi() (_rr->r_esi)
+#define recomp_leaf_st_esi(v) ((void)(_rr->r_esi = (v)))
+#define recomp_leaf_ld_edi() (_rr->r_edi)
+#define recomp_leaf_st_edi(v) ((void)(_rr->r_edi = (v)))
+#define recomp_leaf_ld_esp() (_rr->r_esp)
+#define recomp_leaf_st_esp(v) ((void)(_rr->r_esp = (v)))
+#define recomp_leaf_ld_mm0() (_rr->r_mm[0])
+#define recomp_leaf_st_mm0(v) ((void)(_rr->r_mm[0] = (v)))
+#define recomp_leaf_ld_mm1() (_rr->r_mm[1])
+#define recomp_leaf_st_mm1(v) ((void)(_rr->r_mm[1] = (v)))
+#define recomp_leaf_ld_mm2() (_rr->r_mm[2])
+#define recomp_leaf_st_mm2(v) ((void)(_rr->r_mm[2] = (v)))
+#define recomp_leaf_ld_mm3() (_rr->r_mm[3])
+#define recomp_leaf_st_mm3(v) ((void)(_rr->r_mm[3] = (v)))
+#define recomp_leaf_ld_mm4() (_rr->r_mm[4])
+#define recomp_leaf_st_mm4(v) ((void)(_rr->r_mm[4] = (v)))
+#define recomp_leaf_ld_mm5() (_rr->r_mm[5])
+#define recomp_leaf_st_mm5(v) ((void)(_rr->r_mm[5] = (v)))
+#define recomp_leaf_ld_mm6() (_rr->r_mm[6])
+#define recomp_leaf_st_mm6(v) ((void)(_rr->r_mm[6] = (v)))
+#define recomp_leaf_ld_mm7() (_rr->r_mm[7])
+#define recomp_leaf_st_mm7(v) ((void)(_rr->r_mm[7] = (v)))
 
 /* An indirect call that finds no target sets esp and eax itself. In a
  * function whose registers are C locals (translator _localize_registers)

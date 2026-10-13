@@ -36,8 +36,7 @@ int SDL_ShowSimpleMessageBox(uint32_t flags, const char *title, const char *mess
                              void *window);
 #endif
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+#include <xbox/recomp_regs.h>
 extern ptrdiff_t g_xbox_mem_offset;
 extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;

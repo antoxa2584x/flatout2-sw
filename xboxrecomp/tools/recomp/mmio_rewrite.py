@@ -69,10 +69,47 @@ def _statement_end(s, i):
 _DEV_NAMES = re.compile(r"(?<![A-Za-z0-9_])(XBOX_PTR|MEMF|MEMD|SMEM64)\(")
 
 
+# MMX/SSE memory forms: the address argument (index) goes through the fold.
+# FlatOut 2's XMV decoder writes decoded blocks into the movie surface with
+# movq through its tiled address (0xF10EC000) -- a fault on the Switch.
+_VEC_ADDR_ARG = {"MMX_MEM": 0, "XMM_MEM": 0, "MMX_STORE": 0, "XMM_STORE": 0,
+                 "XMM_STORE_LOW": 0, "XMM_STORE_HIGH": 0,
+                 "XMM_LOAD_LOW": 1, "XMM_LOAD_HIGH": 1}
+_VEC_NAMES = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(
+    sorted(_VEC_ADDR_ARG, key=len, reverse=True)) + r")\(")
+
+
+def _fold_vec(code):
+    out, pos = [], 0
+    while True:
+        m = _VEC_NAMES.search(code, pos)
+        if not m:
+            out.append(code[pos:])
+            return "".join(out)
+        end = _close_paren(code, m.end())          # index after ')'
+        inner = code[m.end():end - 1]
+        args, depth, start = [], 0, 0
+        for i, c in enumerate(inner):
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif c == "," and depth == 0:
+                args.append(inner[start:i])
+                start = i + 1
+        args.append(inner[start:])
+        k = _VEC_ADDR_ARG[m.group(1)]
+        if k < len(args) and "XBOX_DEV_FOLD" not in args[k]:
+            lead = len(args[k]) - len(args[k].lstrip())
+            args[k] = args[k][:lead] + f"XBOX_DEV_FOLD({args[k].strip()})"
+        out.append(code[pos:m.start()] + m.group(1) + "(" + ",".join(args) + ")")
+        pos = end
+
+
 def rewrite(code):
     """Rewrite every memory access in `code` to its device-aware form."""
-    return _DEV_NAMES.sub(lambda m: {"XBOX_PTR": "XBOX_DEV_PTR("}.get(
-        m.group(1), "DEV_" + m.group(1) + "("), _rewrite_mem(code))
+    return _fold_vec(_DEV_NAMES.sub(lambda m: {"XBOX_PTR": "XBOX_DEV_PTR("}.get(
+        m.group(1), "DEV_" + m.group(1) + "("), _rewrite_mem(code)))
 
 
 def _rewrite_mem(code):

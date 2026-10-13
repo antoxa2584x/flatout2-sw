@@ -1159,12 +1159,78 @@ void recomp_spin_wake(void)
     pthread_mutex_unlock(&s_hw_lock);
 }
 #else
+void recomp_hw_progress(void) {}
+void recomp_spin_yield(void);
+void recomp_spin_block(void) { recomp_spin_yield(); }
 void recomp_spin_wake(void)
 {
     volatile uint32_t *pfb = (volatile uint32_t *)
         ((uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u + 0x100410u);
     if (*pfb & 0x00010000u)
         *pfb &= ~0x00010000u;
+}
+#endif
+
+/* Progress of the hardware threads, for guest poll loops to sleep on.
+ *
+ * A poll loop (RECOMP_SPIN_HINT) used to wake the register threads every 16
+ * turns and give up the guest lock every 64 -- futex calls by the hundred
+ * per millisecond. On the console a quarter of FlatOut 2's game thread went
+ * to that while it waited for the GPU fence (D3D BlockOnTime). Now, every
+ * 64 turns, it wakes them once and sleeps, lock released, until they report
+ * a pass (recomp_hw_progress, after each pushbuffer scan and vblank) or
+ * RECOMP_SPIN_SLEEP_US (default 250) runs out. =0 restores the old yield. */
+#if !defined(_WIN32)
+static pthread_cond_t  s_prog_cond = PTHREAD_COND_INITIALIZER;
+static volatile unsigned s_prog_count;
+static volatile int    s_prog_waiters;
+
+void recomp_hw_progress(void)
+{
+    if (!__atomic_load_n(&s_prog_waiters, __ATOMIC_RELAXED)) {
+        __atomic_add_fetch(&s_prog_count, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    pthread_mutex_lock(&s_hw_lock);
+    s_prog_count++;
+    pthread_cond_broadcast(&s_prog_cond);
+    pthread_mutex_unlock(&s_hw_lock);
+}
+
+int xbox_gil_suspend(void);
+void xbox_gil_resume(int depth);
+void recomp_spin_yield(void);
+
+void recomp_spin_block(void)
+{
+    static long us = -1;
+    struct timespec ts;
+    unsigned seen;
+    int d;
+
+    if (us < 0) {
+        const char *e = getenv("RECOMP_SPIN_SLEEP_US");
+        us = e && *e ? atol(e) : 250;
+    }
+    if (us <= 0) {
+        recomp_spin_wake();
+        recomp_spin_yield();
+        return;
+    }
+    seen = __atomic_load_n(&s_prog_count, __ATOMIC_RELAXED);
+    recomp_spin_wake();                   /* the register threads: answer now */
+    d = xbox_gil_suspend();
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += us * 1000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&s_hw_lock);
+    __atomic_add_fetch(&s_prog_waiters, 1, __ATOMIC_RELAXED);
+    while (seen == s_prog_count)
+        if (pthread_cond_timedwait(&s_prog_cond, &s_hw_lock, &ts) != 0)
+            break;
+    __atomic_sub_fetch(&s_prog_waiters, 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&s_hw_lock);
+    xbox_gil_resume(d);
 }
 #endif
 
@@ -1233,6 +1299,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         nv2a_ack_flags(regs);
+        recomp_hw_progress();
         pvideo_tick(regs);
         if (g_nv2a_overlay_tick)
             g_nv2a_overlay_tick();
@@ -1326,6 +1393,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t_last); }
                         QueryPerformanceCounter(&a);
                         nv2a_pb_scan(put);
+                        recomp_hw_progress();       /* fences released */
                         QueryPerformanceCounter(&b);
                         busy += b.QuadPart - a.QuadPart;
                         if (b.QuadPart - t_last.QuadPart > f.QuadPart) {
@@ -1505,7 +1573,9 @@ uint32_t g_xbox_code_hi = 0;
 /* Global registers for recompiled code (via recomp_types.h) */
 /* Each guest thread's TIB. The first thread uses the one the loader built;
  * a spawned thread gets its own from xbox_AllocThreadTib(). */
-RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
+/* The guest register file (recomp_regs.h). */
+RECOMP_TLS RecompRegs _rr[1] = {{ .r_fs_base = XBOX_TIB_MAIN,
+                                  .r_fp_control_word = 0x037Fu, .r_fp_cc = 0x4000 }};
 
 /* The shape of the TLS block the loader built, so a new thread can be
  * given one just like it: where the initialised image data starts, how
@@ -1513,8 +1583,6 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
  * at is. Zero total means the image had no TLS directory. */
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
-RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
-RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 #ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
@@ -1576,9 +1644,6 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 #endif
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
-RECOMP_TLS uint32_t g_seh_ebp = 0;
-RECOMP_TLS double g_fp_stack[8];
-RECOMP_TLS int g_fp_top = 0;
 
 /* Set once at startup. The generated code reads it at the ret of every
  * --force-return function, so it has to be cheap and it has to default to
@@ -1587,13 +1652,8 @@ RECOMP_TLS int g_fp_top = 0;
 int g_force_return = 0;
 /* x87 control and status. The reset default masks every exception and
  * rounds to nearest, which is what the CRT expects before _control87. */
-RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
-RECOMP_TLS int g_fp_cmp = 0;
-RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
 /* Defined below, with the other guest registers. */
-extern RECOMP_TLS uint32_t g_ebp;
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi;
 
 /* ---- non-local jumps ---------------------------------------------------
  *
@@ -2115,13 +2175,8 @@ void xbox_WatchdogStart(void)
 }
 
 /* SSE. 128 bits of architectural state, per-thread like the rest. */
-RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
-RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
-RECOMP_TLS uint32_t g_ebp = 0;
 
 /* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
  * ABI's resting state and what almost every one of them does -- so this is
@@ -2130,7 +2185,6 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * `std; repne scasb`, and memmove goes backwards when its regions overlap the
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
-RECOMP_TLS int g_df = 0;
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
@@ -3115,7 +3169,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          */
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
+        /* RECOMP_NO_TILED=1: leave it unmapped, as on the Switch, so that
+         * any access through it outside the fold faults (a test switch). */
         g_tiled_view = g_contig_mapping
+                       && !(getenv("RECOMP_NO_TILED") && *getenv("RECOMP_NO_TILED") == '1')
             ? MapViewOfFileEx(
                 g_contig_mapping,
                 FILE_MAP_ALL_ACCESS,

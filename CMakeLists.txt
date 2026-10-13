@@ -74,6 +74,13 @@ if(NFSU2_VULKAN)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_VULKAN=1)
 endif()
 
+# No fold of the tiled aperture on every guest access (the Switch default):
+# FlatOut 2's game code never goes through 0xF0000000; the libraries that do
+# (D3D, D3DX, XGRPH, XMV) are lifted device-aware and fold on their own, and
+# the native XMV converter folds its surface. Checked on Linux with the
+# aperture unmapped (RECOMP_NO_TILED=1): intro movies, menus, a race.
+target_compile_definitions(${PROJECT_NAME} PRIVATE RECOMP_FOLD_TILED=0)
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${NFSU2_GEN_DIR}

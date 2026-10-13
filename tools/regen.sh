@@ -40,5 +40,5 @@ mkdir -p "$GEN"
 rm -f "$GEN/recomp_types.h"
 python3 -m tools.recomp "$XBE" --game-name "FlatOut 2" --all --split 250 \
     --gen-dir "$GEN" --exclude-manual "$HERE/src/recomp_manual.c" \
-    --mmio-sections DSOUND,XPP,D3D,D3DX,XGRPH \
+    --mmio-sections DSOUND,XPP,D3D,D3DX,XGRPH,XMV \
     ${TRACE_FUNCS:+--trace-functions "$TRACE_FUNCS"}

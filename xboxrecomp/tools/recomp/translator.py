@@ -293,12 +293,21 @@ def _localize_leaf_registers(lines, instructions, start, end):
     if not re.search(r"\breturn;", body):
         return lines
 
-    loads = [f"    {t} g_{r} = recomp_leaf_ld_{r}(); /* leaf: register in a local */"
-             for r, t in used]
+    # g_* are macros over the register struct (recomp_regs.h): the locals
+    # get their own names, and the macros point at them for this body.
+    def _field(r):
+        return f"r_mm[{r[2:]}]" if r.startswith("mm") else f"r_{r}"
+    loads = []
+    for r, _ in used:
+        loads += [f"#undef g_{r}", f"#define g_{r} L_{r}"]
+    loads += [f"    {t} L_{r} = recomp_leaf_ld_{r}(); /* leaf: register in a local */"
+              for r, t in used]
     store = " ".join(f"recomp_leaf_st_{r}(g_{r});" for r, _ in used)
     out = lines[:at + 1] + loads
     for l in lines[at + 1:]:
         out.append(re.sub(r"\breturn;", f"{{ {store} return; }}", l))
+    for r, _ in used:
+        out += [f"#undef g_{r}", f"#define g_{r} (_rr->{_field(r)})"]
     return out
 
 
@@ -382,13 +391,19 @@ def _localize_x87_stack(lines):
     spill = "recomp_fp_top_st(g_fp_top);"
     reload = "g_fp_top = recomp_fp_top_ld();"
     out = lines[:at + 1]
-    out.append("    double *const g_fp_stack = recomp_fp_base(); "
-               "int g_fp_top = recomp_fp_top_ld(); /* x87 top in a local */")
+    # g_fp_stack / g_fp_top are macros over the register struct
+    # (recomp_regs.h): the locals get their own names for this body.
+    out += ["#undef g_fp_stack", "#define g_fp_stack L_fp_stack",
+            "#undef g_fp_top", "#define g_fp_top L_fp_top"]
+    out.append("    double *const L_fp_stack = recomp_fp_base(); "
+               "int L_fp_top = recomp_fp_top_ld(); /* x87 top in a local */")
     for l in body:
         out.append(_wrap_calls(l, _X87_CALL_RE, spill, reload))
     # Control that runs off the end returns too (steps after this one add
     # the closing brace).
     out.append(f"    {spill} /* x87 top back at the end */")
+    out += ["#undef g_fp_stack", "#define g_fp_stack (_rr->r_fp_stack)",
+            "#undef g_fp_top", "#define g_fp_top (_rr->r_fp_top)"]
     return out
 
 
@@ -444,11 +459,19 @@ def _localize_registers(lines):
     spill = " ".join(f"recomp_leaf_st_{r}(g_{r});" for r in used)
     reload = " ".join(f"g_{r} = recomp_leaf_ld_{r}();" for r in used)
     out = lines[:at + 1]
-    out.append("    " + " ".join(f"uint32_t g_{r} = recomp_leaf_ld_{r}();" for r in used)
+    # g_eax ... are macros over the register struct (recomp_regs.h), so the
+    # locals get their own names and the macros point at them for this body.
+    for r in used:
+        out.append(f"#undef g_{r}")
+        out.append(f"#define g_{r} L_{r}")
+    out.append("    " + " ".join(f"uint32_t L_{r} = recomp_leaf_ld_{r}();" for r in used)
                + " /* registers in locals */")
     for l in body:
         out.append(_wrap_calls(l, _REG_CALL_RE, spill, reload))
     out.append(f"    {spill} /* registers back at the end */")
+    for r in used:
+        out.append(f"#undef g_{r}")
+        out.append(f"#define g_{r} (_rr->r_{r})")
     return out
 
 
@@ -2443,6 +2466,8 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        # This thread's register struct, read once (recomp_regs.h).
+        lines.append("    RECOMP_RR_DECL")
 
         # Optional entry trace. Bring-up is mostly "which of these ten init
         # calls does it not come back from", and answering that by overriding

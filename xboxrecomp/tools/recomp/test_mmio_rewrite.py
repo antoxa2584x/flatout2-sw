@@ -34,10 +34,10 @@ def test_comparison_is_not_a_store():
 
 
 def test_other_accessors_untouched():
-    # XMM_MEM is not rewritten; MEMF/SMEM64 get their tiled-aperture folding
-    # forms (test_block_forms_and_wide_accessors_fold_the_tiled_aperture).
-    src = "xmm0 = XMM_MEM(ebp + 8);"
-    assert rewrite(src) == src
+    # XMM_MEM keeps its name with the address folded
+    # (test_vector_memory_forms_fold_their_address); MEMF/SMEM64 get their
+    # tiled-aperture folding forms.
+    assert rewrite("xmm0 = XMM_MEM(ebp + 8);") == "xmm0 = XMM_MEM(XBOX_DEV_FOLD(ebp + 8));"
     assert rewrite("f = MEMF(eax); SMEM64(eax);") == \
         "f = DEV_MEMF(eax); DEV_SMEM64(eax);"
 
@@ -65,3 +65,12 @@ def test_block_forms_and_wide_accessors_fold_the_tiled_aperture():
                    " d = DEV_MEMD(ebx); q = DEV_SMEM64(ecx);")
     # Idempotent: a second pass leaves the folded forms alone.
     assert rewrite(got) == got
+
+
+def test_vector_memory_forms_fold_their_address():
+    # FlatOut 2's XMV decoder: movq stores into a tiled movie surface.
+    from tools.recomp.mmio_rewrite import rewrite
+    out = rewrite("MMX_STORE(edi + 8, mm0); mm1 = MMX_MEM(esi); XMM_LOAD_HIGH(xmm1, ecx + 4);")
+    assert "MMX_STORE(XBOX_DEV_FOLD(edi + 8), mm0)" in out
+    assert "MMX_MEM(XBOX_DEV_FOLD(esi))" in out
+    assert "XMM_LOAD_HIGH(xmm1, XBOX_DEV_FOLD(ecx + 4))" in out

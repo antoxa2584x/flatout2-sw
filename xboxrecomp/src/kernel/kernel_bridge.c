@@ -62,11 +62,7 @@ int xbox_log_quiet(void)
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
  * here binds to the TLS template rather than the calling thread's copy, which
  * reads as every register being zero. */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
-extern RECOMP_TLS uint32_t g_ebp;          /* the guest frame chain (wait report) */
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
-extern RECOMP_TLS uint32_t g_seh_ebp;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* Dispatch table lookup (for function pointer args) */
@@ -2991,6 +2987,10 @@ static void kernel_vblank_tick(void)
     else
         s_vb_next_us += VBLANK_PERIOD_US;         /* on time: no drift */
     InterlockedIncrement(&s_vb_count);
+    {
+        extern void recomp_hw_progress(void);
+        recomp_hw_progress();                 /* vblank pollers */
+    }
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;

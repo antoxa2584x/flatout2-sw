@@ -418,7 +418,7 @@ typedef union RecompXmm {
  * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
  * it. */
 #define XBOX_TIB_MAIN       0x00004000
-extern RECOMP_TLS uint32_t g_fs_base;
+#include "../../include/xbox/recomp_regs.h"   /* g_fs_base and the rest of the register file */
 #define XBOX_FS_BASE        g_fs_base
 
 #define XBOX_STACK_BASE     0x00780000
