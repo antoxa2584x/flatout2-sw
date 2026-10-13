@@ -24,6 +24,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 
 /* The generated register model (g_eax/g_esp are thread-local there) and the
  * XBOX_PTR/MEM32 accessors; the register names below are its macros. */
@@ -121,6 +122,31 @@ void sub_00240240(void)
             nv2a_pb_set_semaphore_target(sem);
             fprintf(stderr, "[D3D] GPU semaphore at 0x%08X\n", sem);
             registered = sem;
+        }
+        {
+            /* FO2_FENCE_STATS=1: who waits on fences, how often, how long. */
+            static int st = -1;
+            if (st < 0) { const char *e = getenv("FO2_FENCE_STATS"); st = e && *e == '1'; }
+            if (st) {
+                enum { N = 16 };
+                static uint32_t ra[N], ra2[N]; static unsigned cnt[N]; static double ms[N];
+                static uint64_t last; struct timespec t0, t1; int k;
+                uint32_t r = MEM32(esp), r2 = r == 0x0023B89Cu ? MEM32(esp + 12) : 0;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                sub_00240240_gen();
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                for (k = 0; k < N && ra[k] && (ra[k] != r || ra2[k] != r2); k++) ;
+                if (k < N) { ra[k] = r; ra2[k] = r2; cnt[k]++;
+                    ms[k] += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6; }
+                if (!last) last = t1.tv_sec;
+                if ((uint64_t)t1.tv_sec - last >= 10) {
+                    last = t1.tv_sec;
+                    for (k = 0; k < N && ra[k]; k++)
+                        fprintf(stderr, "[fence] ret %08X/%08X: %u waits, %.0f ms\n", ra[k], ra2[k], cnt[k], ms[k]);
+                    memset(cnt, 0, sizeof cnt); memset(ms, 0, sizeof ms);
+                }
+                return;
+            }
         }
         sub_00240240_gen();
         return;

@@ -100,6 +100,22 @@ commits as `Anton Artemov <antoxa2584@gmail.com>`).
   aniso=16, fxaa=1; RECOMP_GL_SCALE overrides). Logged as [options]/[mode].
 - Shader/pipeline caches on the Switch were read from sdmc:/switch/b3x/
   (hard-coded in the toolkit); now sdmc:/switch/fo2x/.
+- **Options menu hang (seeds):** the Options handler 0x5D960 follows a
+  jump table that decodes as junk, so no ret/jmp precedes its int3 padding
+  and cc_boundary never fired: unresolved ICALL, the menu hung. Seeded with
+  the 6 other uncovered 16-aligned starts after int3 runs (0x5DB60,
+  0x1107C0, 0x117900, 0x161B70, 0x169BC0, 0x1AFC00).
+- **Frame pacing:** the renderer waits once per frame (sub_001BEFD6 ->
+  BlockOnFence) on the older of two fences ([0x42C3DC + idx*4]), i.e. two
+  frames in flight already; on the console "GL thread idle 0%" -- the
+  executor/Vulkan side is the limit, not game code (its Linux profile is
+  flat: top lifted function sub_001D93F0 ~10% of game CPU). FO2_FENCE_STATS=1
+  logs fence waits per caller every 10 s. RECOMP_CULL=1 in fo2x_env.txt
+  (off-screen draws skipped; races looked complete on Linux). Next step: a
+  console profile (RECOMP_NX_PROFILE=1 -> prof.bin; tools/prof_report.py
+  prof.bin <the NRO's elf> log; ELFs kept in /root/fo2x/elf/).
+- Main menu is data/scripts/MainMenu.bed in flatout2.bfs (bfs1 v0x20040505,
+  24-byte entries, encoded names) -- for hiding the Xbox Live item later.
 - Debug aids added: FRAME_TRACE prints texture formats/control0 per stage;
   `RECOMP_VK_SKIP_BLEND=<hex dfactor>` drops blended draws with that factor.
 

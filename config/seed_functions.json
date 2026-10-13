@@ -72,5 +72,33 @@
  {
   "start": "0x002333C0",
   "note": "PsCreateSystemThreadEx StartContext1 observed at runtime (FMOD stream thread)."
+ },
+ {
+  "start": "0x0005D960",
+  "note": "Code after int3 padding that follows a jump table (no ret/jmp before it, so cc_boundary missed it); 0x5D960 is the Options menu handler (unresolved ICALL -> hang)."
+ },
+ {
+  "start": "0x0005DB60",
+  "note": "Code after int3 padding that follows a jump table (no ret/jmp before it, so cc_boundary missed it); 0x5D960 is the Options menu handler (unresolved ICALL -> hang)."
+ },
+ {
+  "start": "0x001107C0",
+  "note": "Code after int3 padding that follows a jump table (no ret/jmp before it, so cc_boundary missed it); 0x5D960 is the Options menu handler (unresolved ICALL -> hang)."
+ },
+ {
+  "start": "0x00117900",
+  "note": "Code after int3 padding that follows a jump table (no ret/jmp before it, so cc_boundary missed it); 0x5D960 is the Options menu handler (unresolved ICALL -> hang)."
+ },
+ {
+  "start": "0x00161B70",
+  "note": "Code after int3 padding that follows a jump table (no ret/jmp before it, so cc_boundary missed it); 0x5D960 is the Options menu handler (unresolved ICALL -> hang)."
+ },
+ {
+  "start": "0x00169BC0",
+  "note": "Code after int3 padding that follows a jump table (no ret/jmp before it, so cc_boundary missed it); 0x5D960 is the Options menu handler (unresolved ICALL -> hang)."
+ },
+ {
+  "start": "0x001AFC00",
+  "note": "Code after int3 padding that follows a jump table (no ret/jmp before it, so cc_boundary missed it); 0x5D960 is the Options menu handler (unresolved ICALL -> hang)."
  }
 ]
