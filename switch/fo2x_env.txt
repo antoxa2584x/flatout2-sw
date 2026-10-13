@@ -13,10 +13,9 @@ RECOMP_AUDIO_VOLUME=100
 # Playing, not testing: =1 no log file, no [perf] reports, no profiler.
 NFSU2_NO_LOG=0
 
-# Skip draws whose geometry is entirely off screen before they reach the
-# GPU (an NFSU2 speed-up; nothing missing in FlatOut 2 races on Linux).
-# =0 if something vanishes.
-RECOMP_CULL=1
+# Off-screen draw culling in the executor (an NFSU2 speed-up). Off: on
+# the console it cost more executor time (10%) than drawing itself (7%).
+RECOMP_CULL=0
 
 # Diagnosing slowness: 1 kHz samples of the busy threads into
 # sdmc:/switch/fo2x/prof.bin -- bring it back with fo2x_log.txt.

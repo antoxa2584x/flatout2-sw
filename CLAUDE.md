@@ -110,10 +110,15 @@ commits as `Anton Artemov <antoxa2584@gmail.com>`).
   frames in flight already; on the console "GL thread idle 0%" -- the
   executor/Vulkan side is the limit, not game code (its Linux profile is
   flat: top lifted function sub_001D93F0 ~10% of game CPU). FO2_FENCE_STATS=1
-  logs fence waits per caller every 10 s. RECOMP_CULL=1 in fo2x_env.txt
-  (off-screen draws skipped; races looked complete on Linux). Next step: a
-  console profile (RECOMP_NX_PROFILE=1 -> prof.bin; tools/prof_report.py
-  prof.bin <the NRO's elf> log; ELFs kept in /root/fo2x/elf/).
+  logs fence waits per caller every 10 s. Console profile 2026-10-13
+  (dc83957, docked clocks): executor waits ~29% on flip retirement (not
+  saturated), RECOMP_CULL cost 10.4% vs vk_draw_raw 6.6% -> off again;
+  overlay presenter 10.7% (re-converted every 16 ms) -> only new frames.
+  Game thread: real work spread thin (collision sub_001D93F0 5%, physics
+  under sub_0007E6E0), ~20% lock/spin syscalls in the BlockOnTime wait,
+  __aarch64_read_tp 4% (TLS guest registers). FPS 20-30 = missing the
+  2-vblank deadline. Profiling: RECOMP_NX_PROFILE=1 -> prof.bin;
+  tools/prof_report.py prof.bin <the NRO's elf> log; ELFs in /root/fo2x/elf/.
 - Main menu is data/scripts/MainMenu.bed in flatout2.bfs (bfs1 v0x20040505,
   24-byte entries, encoded names) -- for hiding the Xbox Live item later.
 - Debug aids added: FRAME_TRACE prints texture formats/control0 per stage;

@@ -4230,9 +4230,22 @@ void nv2a_vk_overlay_tick(void)
     now = hz_now();
     if (now - s_guest_flip_ns < 100000000ull || now - last_ns < 16000000ull)
         return;
+    src   = (pv[0x900 / 4] + pv[0x920 / 4]) & 0x07FFFFFFu;
+    {
+        /* Only a new frame is converted: UpdateOverlay points buffer 0 at
+         * the next surface for each movie frame. The same offset again is
+         * the frame already on screen (or, during a load after a movie
+         * whose overlay was never stopped, a stale one): converting it at
+         * 60 Hz was 10% of this thread on the console. */
+        static uint32_t last_src, last_vb;
+        uint32_t vb = pv[0x928 / 4] ^ pv[0x950 / 4];
+        if (src == last_src && vb == last_vb)
+            return;
+        last_src = src;
+        last_vb = vb;
+    }
     last_ns = now;
 
-    src   = (pv[0x900 / 4] + pv[0x920 / 4]) & 0x07FFFFFFu;
     pitch = pv[0x958 / 4] & 0x1FFFu;
     ox = pv[0x948 / 4] & 0xFFFFu; oy = pv[0x948 / 4] >> 16;
     ow = pv[0x950 / 4] & 0xFFFFu; oh = pv[0x950 / 4] >> 16;
