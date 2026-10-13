@@ -80,17 +80,18 @@ commits as `Anton Artemov <antoxa2584@gmail.com>`).
   (fast log2 at 0x15AA70).
 - **Teal car shadows (toolkit nv2a_vk vk_clear):** the shadow target is
   R5G6B5, cleared to 0xFFFF; the clear value is in the surface's format.
-- **Distorted sound in races (src/main.c RECOMP_APU_DOWNMIX, toolkit
-  apu_dsp.c):** FMOD loads its own GP DSP image (Data/Sound/fmodfx.bin);
-  the runtime's DSP is a passthrough that sums mixbins to stereo. Race
-  effects go to bins 6/7 (RMS ~0.28) plus the same signal at half level to
-  the reverb send 10; music to 0/1 (RMS ~0.04). Summed dry, the console mix
-  hit full scale (peak 32739 in [perf] audio out) and the final tanh
-  crushed it. FlatOut 2's gains: 6/7 x0.5, 8/9 x0.35, 10 off.
-  `RECOMP_APU_BIN_STATS=1` prints per-bin RMS/peak every 5 s.
-- **Aspect:** the title draws the same 4:3 frame with or without the
-  widescreen flag, so main.c sets RECOMP_WIDESCREEN=0 (4:3, full height);
-  stretching to 16:9 widened everything.
+- **Engine/crash sounds were noise (toolkit kernel_memory.c):** FMOD asks
+  MmGetPhysicalAddress for its sample banks (heap, 0x0157xxxx) before the
+  contiguous arena hands out that physical range, so the low-VA tag
+  (XBOX_PHYS_LOWVA_TAG, Burnout 3's fix) was not applied and the APU read the
+  arena: every ADPCM effect voice decoded as full-scale noise (bad block
+  headers, peak 32739 on the console). Every VA below 64 MB is now tagged.
+  Check: tools/adpcm.py <va> decodes guest memory as Xbox ADPCM (bad headers
+  / spectral flatness). RECOMP_APU_DOWNMIX="10:0.25:0.25" keeps a little of
+  FMOD's reverb send (6/7 effects, 0/1 music); RECOMP_APU_BIN_STATS=1 prints
+  per-bin RMS/peak.
+- **Aspect:** widescreen on (16:9 stretch, as a 16:9 TV shows the Xbox);
+  the title screen is the same frame either way. RECOMP_WIDESCREEN=0 = 4:3.
 - **Switch profiles (src/switch_nx.c):** clocks from fo2x_env.txt
   (switch/fo2x_env.txt, staged by build.sh when the SD has none): CPU 1785
   / GPU 768 / memory 1600 MHz in both modes; FO2_DOCK_BOOST=1 instead =

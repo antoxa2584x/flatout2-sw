@@ -188,8 +188,16 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * passed through, a device would read the window instead. Burnout 3 loads
      * its engine sounds into heap memory at 0x01A6xxxx, the arena owns
      * physical 0x01A6xxxx too, and the APU played the arena's zeros -- no
-     * engine sound. Tagged, the device reads the VA (xbox_devbus.c). */
-    if (va < XBOX_PHYS_LOWVA_TAG && xbox_ContiguousIsPhysical(va))
+     * engine sound. Tagged, the device reads the VA (xbox_devbus.c).
+     *
+     * Every such VA, not only the ones the arena has handed out so far:
+     * here contiguous memory always lives at XBOX_CONTIG_BASE, so a VA below
+     * 64 MB is never itself physical. FlatOut 2's FMOD asks for its sample
+     * banks' addresses (heap, 0x0157xxxx) before the arena reaches that
+     * physical range; untagged, the APU later read the arena there and every
+     * engine and crash sound was full-scale noise. */
+    (void)xbox_ContiguousIsPhysical;
+    if (va && va < XBOX_PHYS_LOWVA_TAG)
         return (ULONG_PTR)(va | XBOX_PHYS_LOWVA_TAG);
     return (ULONG_PTR)va;
 }
