@@ -89,6 +89,8 @@ ninja -C "$BUILD" -j"$JOBS"
 DEST="$SD/switch/fo2x"
 mkdir -p "$DEST/game"
 cp "$BUILD/fo2_recomp.nro" "$DEST/$NRO_NAME"
+# Default settings, only when the card has none (edits there are kept).
+[ -f "$DEST/fo2x_env.txt" ] || cp "$REPO/switch/fo2x_env.txt" "$DEST/fo2x_env.txt"
 # The disc image is 2.6 GB: copy only what changed.
 rsync -a --size-only "$GAME/" "$DEST/game/" --exclude '*_analysis.json' --exclude UDATA --exclude TDATA --exclude CACHE
 echo

@@ -1019,10 +1019,10 @@ static void clk_hook(AppletHookType hook, void *param)
 
 /* ── Docked / handheld profiles ───────────────────────────────────
  *
- * Without NFSU2_*_MHZ in fo2x_env.txt the clocks are boosted while docked
- * only (CPU 1785, GPU 768 = the docked GPU clock, memory 1600 MHz;
- * FO2_DOCK_BOOST=0 turns that off): on the dock there is no battery to
- * spare, and the game thread is what limits the frame rate. Handheld keeps
+ * Clocks come from fo2x_env.txt as in the other ports: NFSU2_CPU_MHZ /
+ * NFSU2_GPU_MHZ / NFSU2_MEM_MHZ, applied in both modes (the shipped file
+ * sets the docked rates 1785 / 768 / 1600). FO2_DOCK_BOOST=1 with those
+ * unset boosts to the same rates while docked only and leaves handheld at
  * the system's clocks (the system resets them itself on undock).
  *
  * The picture follows the mode too, from sdmc:/switch/fo2x/fo2x_options.txt
@@ -1142,7 +1142,7 @@ static void clk_apply(void)
             s_clk[i].want_hz = s_clk[i].cap_hz;
         any |= s_clk[i].want_hz != 0;
     }
-    if (!any && !(db && *db == '0')) {
+    if (!any && db && *db == '1') {
         for (i = 0; i < 3; i++)
             s_clk[i].want_hz = (u32)(boost_mhz[i] * 1e6);
         s_dock_only = any = 1;

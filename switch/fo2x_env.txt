@@ -1,0 +1,25 @@
+# fo2x_env.txt -- KEY=VALUE per line, '#' comments. Sits next to the NRO as
+# sdmc:/switch/fo2x/fo2x_env.txt; the log then lists every setting as
+# "[switch] env KEY=VALUE". switch/build.sh stages this copy only when the
+# SD has none, so edits on the card are kept.
+
+# GL calls on a thread of their own (pushbuffer decoding and the driver on
+# two cores). Set to 0 to compare.
+RECOMP_GL_THREAD=1
+# Guest lock handed over by guest priority. 0 = FIFO with 1 ms grace.
+RECOMP_GIL_EAGER=1
+RECOMP_AUDIO_VOLUME=100
+
+# Playing, not testing: =1 no log file, no [perf] reports, no profiler.
+NFSU2_NO_LOG=0
+
+# Clocks: the docked rates, in both modes (more heat and battery handheld).
+# The log shows "[clock] ...". Comment out for the system's (CPU 1020 MHz);
+# the game thread is CPU-bound, so the CPU clock helps directly.
+# FO2_DOCK_BOOST=1 instead (with these commented out): boost while docked only.
+NFSU2_CPU_MHZ=1785
+NFSU2_GPU_MHZ=768
+NFSU2_MEM_MHZ=1600
+
+# Picture per mode is in fo2x_options.txt (scale_docked, scale_handheld,
+# aniso, fxaa). RECOMP_GL_SCALE=1.5 here would force one scale for both.

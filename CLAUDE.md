@@ -91,9 +91,10 @@ commits as `Anton Artemov <antoxa2584@gmail.com>`).
 - **Aspect:** the title draws the same 4:3 frame with or without the
   widescreen flag, so main.c sets RECOMP_WIDESCREEN=0 (4:3, full height);
   stretching to 16:9 widened everything.
-- **Switch profiles (src/switch_nx.c):** clocks boosted while docked only
-  (CPU 1785 / GPU 768 / memory 1600 MHz; FO2_DOCK_BOOST=0 off, NFSU2_*_MHZ
-  in fo2x_env.txt = always those); render scale per mode from
+- **Switch profiles (src/switch_nx.c):** clocks from fo2x_env.txt
+  (switch/fo2x_env.txt, staged by build.sh when the SD has none): CPU 1785
+  / GPU 768 / memory 1600 MHz in both modes; FO2_DOCK_BOOST=1 instead =
+  docked only; render scale per mode from
   sdmc:/switch/fo2x/fo2x_options.txt (scale_docked=200, scale_handheld=150,
   aniso=16, fxaa=1; RECOMP_GL_SCALE overrides). Logged as [options]/[mode].
 - Shader/pipeline caches on the Switch were read from sdmc:/switch/b3x/
