@@ -1,0 +1,76 @@
+[
+ {
+  "start": "0x001320F9",
+  "note": "PsCreateSystemThreadEx StartContext1 (same body as Burnout 3 0x1D2793 / Carbon 0x2EA16C)."
+ },
+ {
+  "start": "0x002D63C4",
+  "note": "XPP: indirect-call target, unresolved at runtime (Burnout 3 seed 0x362D64)."
+ },
+ {
+  "start": "0x002D6CBF",
+  "note": "XPP: indirect-call target, unresolved at runtime (Burnout 3 0x36365F, Carbon 0x39BD9A)."
+ },
+ {
+  "start": "0x002D65CF",
+  "note": "XPP: Carbon seed 0x39B15C (after zero padding; without it USB never started)."
+ },
+ {
+  "start": "0x002D8187",
+  "note": "XPP XID class driver AddDevice, reached only through the class-driver table (Burnout 3 0x364C40, Carbon 0x39D01D)."
+ },
+ {
+  "start": "0x002D7B68",
+  "note": "XPP XID class driver RemoveDevice (Burnout 3 0x364621)."
+ },
+ {
+  "start": "0x002DD72F",
+  "note": "XPP class driver RemoveDevice (Burnout 3 0x36A200)."
+ },
+ {
+  "start": "0x002DA99E",
+  "note": "XPP: Burnout 3 seed 0x36746F."
+ },
+ {
+  "start": "0x002D7733",
+  "note": "XPP: Burnout 3 0x3641DB, Carbon 0x39C5C9."
+ },
+ {
+  "start": "0x002A0118",
+  "note": "XNET/XMV indirect-call target (Burnout 3 seed 0x347A99)."
+ },
+ {
+  "start": "0x000DFDA0",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000F8570",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001E68A0",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00226710",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000861C0",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000BD8E0",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002333C0",
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime (FMOD stream thread)."
+ }
+]
