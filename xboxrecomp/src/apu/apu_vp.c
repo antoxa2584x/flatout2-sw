@@ -756,8 +756,18 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
  * metallic, crackling edge. That shows as a sample identical to the one read
  * at the same position a lap ago. Only voices whose data mostly changes
  * between laps count: a looped static sample repeats by design. */
+/* Frames a persistent stream voice played nothing because the title had not
+ * queued its next packet (heard as a gap, a pop). mcpx_apu_stream_starved. */
+static volatile uint32_t s_stream_starved;
+uint32_t mcpx_apu_stream_starved(void)
+{
+    uint32_t n = s_stream_starved;
+    s_stream_starved = 0;
+    return n;
+}
+
 #define RING_TRACK_MIN 1024                 /* shorter loops: static samples */
-#define RING_TRACK_MAX 8192
+#define RING_TRACK_MAX 65536                /* FMOD's ADPCM stream rings: 64512 */
 static struct {
     uint32_t *lap;
     uint32_t  same, changed;
@@ -858,6 +868,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         count = d->vp.ssl[v].count[ssl_index];
 
         if (count == 0) {
+            if (persist)
+                s_stream_starved++;     /* the title's next packet not there yet: a gap */
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -932,6 +944,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 samples[sample_count][1] = int16_to_float(
                     adpcm_decoded[block_position * channels + 1]);
             }
+            /* An ADPCM ring (FMOD streams through one): stale reads too. */
+            if (loop && !stream && ebo + 1 >= RING_TRACK_MIN)
+                ring_note(v, cbo, 0x9E3779B1u * (uint16_t)adpcm_decoded[block_position * channels]
+                                  + (stereo ? (uint16_t)adpcm_decoded[block_position * channels + 1] : 0u)
+                                  + 1u);
         } else {
             hwaddr addr;
             if (stream) {
@@ -1148,6 +1165,16 @@ static void vdump_frame(MCPXAPUState *d, uint16_t v, float post[][2], int fmode,
     }
 }
 
+static int s_jump_on = -1;
+static float s_jlast[MCPX_HW_MAX_VOICES], s_jstep[MCPX_HW_MAX_VOICES];
+static uint32_t s_jumps[MCPX_HW_MAX_VOICES], s_jstart[MCPX_HW_MAX_VOICES], s_jstop[MCPX_HW_MAX_VOICES];
+static float s_jamp[MCPX_HW_MAX_VOICES];      /* |last sample| x gain, last frame */
+/* Per-voice mix gains of the last frame (see "Mix into bins"). */
+static uint32_t s_vp_frame_no;
+static uint32_t s_vgain_frame[MCPX_HW_MAX_VOICES];
+static float    s_vgain[MCPX_HW_MAX_VOICES][8];
+static uint8_t  s_vgain_bin[MCPX_HW_MAX_VOICES][8];
+
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
                           float sample_buf[NUM_SAMPLES_PER_FRAME][2],
@@ -1325,18 +1352,73 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
-    /* Mix into bins */
-    for (int b = 0; b < 8; b++) {
-        float g = ea_value;
-        float hr;
-        if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
-            hr = (float)(1 << d->vp.hrtf_headroom);
-        } else {
-            hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+    /* RECOMP_APU_RING_STATS: frame-boundary jumps in a voice's own samples
+     * (before gain): the first sample of this frame far from the last of the
+     * previous one, against the voice's usual step. */
+    if (s_jump_on) {
+        float st = 0.0f, j;
+        for (int i = 1; i < NUM_SAMPLES_PER_FRAME; i++)
+            st += fabsf(samples[i][0] - samples[i - 1][0]);
+        st /= (float)(NUM_SAMPLES_PER_FRAME - 1);
+        s_jstep[v] = s_jstep[v] * 0.98f + st * 0.02f;
+        if (s_vgain_frame[v] + 1 == s_vp_frame_no) {
+            j = fabsf(samples[0][0] - s_jlast[v]);
+            if (j > 0.15f && j > 12.0f * s_jstep[v] + 0.02f)
+                s_jumps[v]++;
         }
-        g *= attenuate(vol[b]) / hr;
-        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += g * samples[i][b % channels];
+        s_jlast[v] = samples[NUM_SAMPLES_PER_FRAME - 1][0];
+    }
+
+    /* Mix into bins.
+     *
+     * Each bin's gain glides toward the voice's target volume, an eighth of
+     * the way per frame (~5 ms to 63%), linearly within the frame. Stepped
+     * at the frame boundary, a title's volume update (FMOD retunes its
+     * voices every 1024 samples, landing at the same sub-frame of every
+     * 256-sample block) cut the waveform: FlatOut 2's High Jump popped
+     * ~12 times a minute; 2.4 with this (the rest are FMOD switching a
+     * voice's buffer, not its volume; a 24-frame glide removes no more).
+     * A voice not mixed in the last frame starts at its gain, so attacks
+     * stay sharp. RECOMP_APU_VOL_RAMP=<frames>: 1 = within one frame,
+     * 0 = the old step. */
+    {
+        static int ramp_on = -1;
+        int fresh;
+        if (ramp_on < 0) {
+            const char *e = getenv("RECOMP_APU_VOL_RAMP");
+            ramp_on = e && *e ? atoi(e) : 8;
+            if (ramp_on < 0) ramp_on = 0;
+        }
+        fresh = s_vgain_frame[v] + 1 != s_vp_frame_no;
+        s_vgain_frame[v] = s_vp_frame_no;
+        for (int b = 0; b < 8; b++) {
+            float g = ea_value, g0, dg;
+            float hr;
+            if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
+                hr = (float)(1 << d->vp.hrtf_headroom);
+            } else {
+                hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
+            }
+            g *= attenuate(vol[b]) / hr;
+            g0 = (!ramp_on || fresh || s_vgain_bin[v][b] != bin[b]) ? g : s_vgain[v][b];
+            /* RECOMP_APU_VOL_RAMP=<frames>: glide over that many frames
+             * (1 = within this one), exponentially toward the target. */
+            if (ramp_on > 1)
+                g = g0 + (g - g0) / (float)ramp_on;
+            dg = (g - g0) / (float)NUM_SAMPLES_PER_FRAME;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                g0 += dg;
+                mixbins[bin[b]][i] += g0 * samples[i][b % channels];
+            }
+            s_vgain[v][b] = g;
+            s_vgain_bin[v][b] = (uint8_t)bin[b];
+        }
+        if (s_jump_on) {
+            float gmax = 0.0f;
+            for (int b = 0; b < 8; b++) if (s_vgain[v][b] > gmax) gmax = s_vgain[v][b];
+            if (fresh && fabsf(samples[0][0]) * gmax > 0.08f)
+                s_jstart[v]++;
+            s_jamp[v] = fabsf(samples[NUM_SAMPLES_PER_FRAME - 1][0]) * gmax;
         }
     }
 
@@ -1454,6 +1536,17 @@ void apu_vp_get_stats(int *voices, float *mix_peak)
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    s_vp_frame_no++;
+    if (s_jump_on < 0)
+        s_jump_on = getenv("RECOMP_APU_RING_STATS") != NULL;
+    if (s_jump_on > 0 && s_vp_frame_no > 2) {
+        /* voices mixed two frames ago and not last frame: stopped then */
+        for (int vv = 0; vv < MCPX_HW_MAX_VOICES; vv++)
+            if (s_vgain_frame[vv] + 2 == s_vp_frame_no && s_jamp[vv] > 0.08f) {
+                s_jstop[vv]++;
+                s_jamp[vv] = 0.0f;
+            }
+    }
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
     g_vp_voices_now = 0;
 
@@ -1503,8 +1596,35 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             uint32_t st, tot;
             if (next) {
                 mcpx_apu_ring_stats(&st, &tot);
-                fprintf(stderr, "[APU] ring voices: %u of %u samples stale (%.2f%%)\n",
-                        st, tot, tot ? 100.0 * st / tot : 0.0);
+                extern uint32_t mcpx_apu_nonfinite(void);
+                fprintf(stderr, "[APU] ring voices: %u of %u samples stale (%.2f%%); "
+                        "most voices in a frame %d; %u non-finite samples silenced;"
+                        " %u stream frames starved\n",
+                        st, tot, tot ? 100.0 * st / tot : 0.0, g_vp_voices_max,
+                        mcpx_apu_nonfinite(), mcpx_apu_stream_starved());
+                {
+                    int vv;
+                    fprintf(stderr, "[APU] frame-boundary jumps by voice:");
+                    for (vv = 0; vv < MCPX_HW_MAX_VOICES; vv++)
+                        if (s_jumps[vv] || s_jstart[vv] || s_jstop[vv])
+                            fprintf(stderr, " v%03X jump %u start %u stop %u (fmt %08X ebo %X)", vv,
+                                    s_jumps[vv], s_jstart[vv], s_jstop[vv],
+                                    voice_get_mask(d, (uint16_t)vv, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+                                    voice_get_mask(d, (uint16_t)vv, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO));
+                    {
+                        extern uint32_t g_bin_jumps[NUM_MIXBINS];
+                        int b2;
+                        fprintf(stderr, " | bins:");
+                        for (b2 = 0; b2 < NUM_MIXBINS; b2++)
+                            if (g_bin_jumps[b2]) fprintf(stderr, " %d x%u", b2, g_bin_jumps[b2]);
+                        memset(g_bin_jumps, 0, sizeof g_bin_jumps);
+                    }
+                    fprintf(stderr, "\n");
+                    memset(s_jumps, 0, sizeof s_jumps);
+                    memset(s_jstart, 0, sizeof s_jstart);
+                    memset(s_jstop, 0, sizeof s_jstop);
+                }
+                g_vp_voices_max = 0;
             }
             next = GetTickCount() + 10000;
         }

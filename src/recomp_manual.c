@@ -108,6 +108,14 @@ void sub_001C8380(void) { crt_memmove(); }
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 extern void sub_00240240_gen(void);
 
+/* RECOMP_LAT_TRACE: the fence the renderer put at the end of its last frame
+ * (two slots at 0x42C3DC, next one written at index [0x42C3E4]). */
+extern uint32_t (*recomp_lat_game_seq)(void);
+static uint32_t fo2_fence_seq(void)
+{
+    return MEM32(0x42C3DCu + ((MEM32(0x42C3E4u) + 1u) & 1u) * 4u);
+}
+
 void sub_00240240(void)
 {
     static int exec = -1;
@@ -119,9 +127,32 @@ void sub_00240240(void)
     if (exec) {
         static uint32_t registered;
         if (sem && sem != registered) {
+            recomp_lat_game_seq = fo2_fence_seq;
             nv2a_pb_set_semaphore_target(sem);
             fprintf(stderr, "[D3D] GPU semaphore at 0x%08X\n", sem);
             registered = sem;
+        }
+        {
+            /* Low latency (default; FO2_LOW_LATENCY=0 for the title's
+             * own): the frame-start wait (0x1BEFD1 -> 0x23B890 -> here)
+             * waits for the last frame's fence instead of the one before
+             * it, so the title builds a frame only once the executor has
+             * taken the previous one -- one frame less between reading the
+             * pad and the screen (~60 ms at 18 fps on Linux), less overlap
+             * of game and executor (race 20 -> 18 fps on lavapipe). */
+            static int low = -1;
+            if (low < 0) {
+                const char *e = getenv("FO2_LOW_LATENCY");
+                low = !(e && *e == '0');
+                fprintf(stderr, "[D3D] low latency %s\n", low
+                        ? "on: frame start waits on the last frame (FO2_LOW_LATENCY=0 off)"
+                        : "off (title's two frames in flight)");
+            }
+            if (low && MEM32(esp) == 0x0023B89Cu && MEM32(esp + 12) == 0x001BEFD6u) {
+                uint32_t last = fo2_fence_seq();
+                if ((int32_t)(last - MEM32(esp + 4)) > 0)
+                    MEM32(esp + 4) = last;
+            }
         }
         {
             /* FO2_FENCE_STATS=1: who waits on fences, how often, how long. */
@@ -244,6 +275,23 @@ void sub_00242AF0(void)
  * it (nv2a_pb_exec.c). */
 extern void sub_00243060_gen(void);
 extern void nv2a_pb_trap_lock(void);
+/* The frame-rate cap (as NFSU2/Carbon: same D3D). Present posts the flip as
+ * NOP trap data (vblanks << 5) | 1 -- software method 1 in the handler's
+ * table at 0x243024, the flip queue 0x242DF0 adding (data >> 5) & 7 vblanks
+ * to the last flip's target. FlatOut 2 asks for 2 (0x10580141): 30 fps at
+ * most. Rewritten to 1 as the trap is taken, a frame ready in time shows on
+ * the next vblank (60 fps at most); slower frames are unchanged.
+ * FO2_FPS_CAP=30 keeps the title's interval. */
+static int fps_cap_30(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("FO2_FPS_CAP");
+        v = e && atoi(e) == 30;
+        fprintf(stderr, "[fps] cap: %s\n", v ? "30 (title)" : "60 (FO2_FPS_CAP=30 for 30)");
+    }
+    return v;
+}
 extern void nv2a_pb_trap_unlock(void);
 extern void nv2a_pb_trap_taken(void);
 
@@ -257,6 +305,15 @@ void sub_00243060(void)
 
     nv2a_pb_trap_lock();
     nsource = nv[0x400108 / 4];
+    if (nsource && (nv[0x400704 / 4] & 0xFFFFu) == 0x0100u && !fps_cap_30()) {
+        uint32_t data = nv[0x400708 / 4];
+        if ((data & 0x1Fu) == 1u && ((data >> 5) & 7u) > 1u) {
+            static int told;
+            nv[0x400708 / 4] = (data & ~(7u << 5)) | (1u << 5);   /* flip: 1 vblank */
+            if (!told++)
+                fprintf(stderr, "[fps] flip interval %u -> 1 vblank (uncapped)\n", (data >> 5) & 7u);
+        }
+    }
     sub_00243060_gen();
     nv2a_pb_flip_retired(MEM32(blk + 0x1BC) - head);   /* a flip queued on its vblank retires at once */
     if (nsource)

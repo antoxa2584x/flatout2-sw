@@ -172,6 +172,10 @@ typedef struct {
 /* draw_raw takes attributes in their stored format (Nv2aRawBatch.attr_direct).
  * RECOMP_GL_DIRECT=0 turns it off at run time. */
 #define NV2A_BACKEND_RAW_DIRECT 0x1u
+/* ...including CMP (type 6, size 1: a normal packed 11:11:10 in one dword),
+ * which the back end unpacks itself. Without it CMP goes through the
+ * converter, every draw, and such draws cannot be merged. */
+#define NV2A_BACKEND_RAW_CMP    0x2u
 
 /* Optional, set by the game project: sees every raw batch just before the
  * back end gets it and may change it. attrs is rb->attrs, writable; an
@@ -196,5 +200,17 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
  * ponytail: the title supplies the address instead of the executor resolving
  * the semaphore context DMA object through RAMIN. */
 void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+
+/* RECOMP_LAT_TRACE=1: input-to-screen latency, one line per pad change.
+ * The title tells which fence its frame in progress will carry
+ * (recomp_lat_game_seq: the D3D device's write sequence); the pad marks a
+ * change, the executor the semaphore release of the first frames built
+ * after it, the renderer their submit and GPU completion. */
+extern uint32_t (*recomp_lat_game_seq)(void);
+int  recomp_lat_on(void);
+void recomp_lat_input(void);
+void recomp_lat_sem(uint32_t value);
+int  recomp_lat_flip(void);           /* 1: this flip carries the frame */
+void recomp_lat_gpu_done(void);
 
 #endif /* NV2A_BACKEND_H */

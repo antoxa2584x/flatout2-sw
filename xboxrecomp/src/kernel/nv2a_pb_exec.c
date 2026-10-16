@@ -442,6 +442,88 @@ static uint32_t s_sem_va;
 static uint32_t s_vtx_epoch;            /* Nv2aRawBatch.vtx_epoch */
 void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
 
+/* ── RECOMP_LAT_TRACE (nv2a_backend.h) ── */
+uint32_t (*recomp_lat_game_seq)(void);
+static struct {
+    volatile int state;                 /* 0 idle, 1 armed, 2 decoded, 3 submitted */
+    uint32_t f0, f1, f2;                /* frame fences: at the change, the two after */
+    uint32_t ahead;                     /* releases the executor was behind f0 */
+    uint64_t t_in, t_f1, t_f2, t_sub;
+} s_lat;
+static uint32_t s_lat_last_sem;
+
+static uint64_t lat_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+int recomp_lat_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_LAT_TRACE");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
+void recomp_lat_input(void)
+{
+    if (!recomp_lat_on() || !recomp_lat_game_seq || s_lat.state)
+        return;
+    s_lat.f0 = recomp_lat_game_seq();
+    s_lat.f1 = s_lat.f2 = 0;
+    s_lat.t_f1 = s_lat.t_f2 = 0;
+    s_lat.ahead = s_lat.f0 - s_lat_last_sem;
+    s_lat.t_in = lat_ns();
+    s_lat.state = 1;
+}
+
+/* The frame being built at the change ends with fence f1 (it may or may
+ * not have read the pad); the first frame built wholly after it with f2.
+ * Both become known as the title inserts them, before the executor gets
+ * there. */
+void recomp_lat_sem(uint32_t value)
+{
+    s_lat_last_sem = value;
+    if (s_lat.state != 1)
+        return;
+    {
+        uint32_t f = recomp_lat_game_seq();
+        if (!s_lat.f1 && f != s_lat.f0) s_lat.f1 = f;
+        else if (s_lat.f1 && !s_lat.f2 && f != s_lat.f1) s_lat.f2 = f;
+    }
+    if (s_lat.f1 && !s_lat.t_f1 && (int32_t)(value - s_lat.f1) >= 0)
+        s_lat.t_f1 = lat_ns();
+    if (s_lat.f2 && (int32_t)(value - s_lat.f2) >= 0) {
+        s_lat.t_f2 = lat_ns();
+        s_lat.state = 2;
+    }
+}
+
+int recomp_lat_flip(void)
+{
+    if (s_lat.state != 2)
+        return 0;
+    s_lat.t_sub = lat_ns();
+    s_lat.state = 3;
+    return 1;
+}
+
+void recomp_lat_gpu_done(void)
+{
+    uint64_t t = lat_ns(), in = s_lat.t_in;
+    if (s_lat.state != 3)
+        return;
+    fprintf(stderr, "[lat] pad change -> frame in progress decoded %.1f ms | next frame decoded %.1f,"
+            " submitted %.1f, GPU done %.1f ms (executor %d fences behind)\n",
+            (s_lat.t_f1 - in) / 1e6, (s_lat.t_f2 - in) / 1e6,
+            (s_lat.t_sub - in) / 1e6, (t - in) / 1e6, (int)s_lat.ahead);
+    s_lat.state = 0;
+}
+
 /* Slot + 1 of each method in s_unhandled: this runs millions of times a
  * second, so no search. The report sorts s_unhandled and rebuilds it. */
 static uint16_t s_unhandled_slot[0x2000 / 4];
@@ -3225,6 +3307,10 @@ static uint16_t raw_direct_attrs(Nv2aRawBatch *rb, uint16_t present,
         case 2: elem = 4 * va->size; break;
         case 4: elem = va->size; break;
         case 1: case 5: elem = 2 * va->size; break;
+        case 6:                         /* CMP: one dword, unpacked by the back end */
+            if (va->size != 1 || !(s_backend->flags & NV2A_BACKEND_RAW_CMP)) continue;
+            elem = 4;
+            break;
         default: continue;
         }
         first = (size_t)va->offset + (size_t)lo * va->stride;
@@ -3381,6 +3467,16 @@ static void raw_batch(void)
                 s_reg[0x1B04 / 4], s_reg[0x1B0C / 4], s_reg[0x1B44 / 4], s_reg[0x1B4C / 4],
                 s_reg[0x1B84 / 4], s_reg[0x1B8C / 4], s_reg[0x1BC4 / 4], s_reg[0x1BCC / 4],
                 s_reg[0x1E70 / 4]);
+        {   /* attributes: index:type.size/stride, '*' = fed directly */
+            char ab[256];
+            int n = 0, a;
+            for (a = 0; a < NV2A_RAW_ATTRS && n < 220; a++)
+                if (rb.attr_present & (1u << a))
+                    n += snprintf(ab + n, sizeof ab - n, " %d:%u.%u/%u%s", a,
+                                  s_gpu.attr[a].type, s_gpu.attr[a].size, s_gpu.attr[a].stride,
+                                  (rb.attr_direct & (1u << a)) ? "*" : "");
+            fprintf(stderr, "[FTRACE]   attrs%s\n", n ? ab : " none");
+        }
     }
     s_backend->draw_raw(&rb);
     s_gpu.tris_drawn += s_gpu.idx_count / 3;
@@ -4171,6 +4267,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (method == 0x1D70 && s_sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         *(volatile uint32_t *)(mem + s_sem_va) = param;
+        recomp_lat_sem(param);
         return;
     }
     /* The pattern object's SET_MONOCHROME_COLOR0 (0x0310) latches into

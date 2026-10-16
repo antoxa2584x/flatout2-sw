@@ -24,6 +24,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include "apu_xaudio2.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -215,6 +216,20 @@ static void bin_stats(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int i)
     }
 }
 
+/* Frame-boundary jumps per mix bin (RECOMP_APU_RING_STATS), read and reset
+ * by apu_vp.c's 10 s report. */
+uint32_t g_bin_jumps[NUM_MIXBINS];
+
+/* Non-finite mixdown samples silenced since the last call (see below). */
+static volatile uint32_t s_nonfinite;
+
+uint32_t mcpx_apu_nonfinite(void)
+{
+    uint32_t n = s_nonfinite;
+    s_nonfinite = 0;            /* ponytail: racy, a counter only */
+    return n;
+}
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -236,7 +251,27 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     dsp_ack_frame(d);
 
+    {   /* RECOMP_APU_RING_STATS: which mix bins jump at a frame boundary */
+        static int on = -1;
+        static float last[NUM_MIXBINS], stepavg[NUM_MIXBINS];
+        if (on < 0) on = getenv("RECOMP_APU_RING_STATS") != NULL;
+        if (on) {
+            for (int b = 0; b < NUM_MIXBINS; b++) {
+                float st = 0.0f, j = fabsf(mixbins[b][0] - last[b]);
+                for (int i = 1; i < NUM_SAMPLES_PER_FRAME; i++)
+                    st += fabsf(mixbins[b][i] - mixbins[b][i - 1]);
+                st /= (float)(NUM_SAMPLES_PER_FRAME - 1);
+                stepavg[b] = stepavg[b] * 0.98f + st * 0.02f;
+                if (j > 0.05f && j > 12.0f * stepavg[b] + 0.01f)
+                    g_bin_jumps[b]++;
+                last[b] = mixbins[b][NUM_SAMPLES_PER_FRAME - 1];
+            }
+        }
+    }
+
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        static ApuLimiter lim;
+        float lr[NUM_SAMPLES_PER_FRAME][2];
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
              * On hardware the GP and EP mix the submixes down; here they are
@@ -279,16 +314,26 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
-            /* Summing every bin goes past full scale (1.33 in the intro
-             * movies), and a hard clamp there is audible distortion. tanh is
-             * near-linear below ~0.5 and bends smoothly into [-1, 1]. */
-            left = tanhf(left);
-            right = tanhf(right);
+            /* A NaN or infinity from any voice (a NaN position or gain
+             * upstream) came out as a sample of 0 -- a pop -- and sat in
+             * the limiter's delay line meanwhile. Silence it, and count it
+             * (mcpx_apu_nonfinite) so a log says where pops come from. */
+            if (!isfinite(left))  { left = 0.0f;  s_nonfinite++; }
+            if (!isfinite(right)) { right = 0.0f; s_nonfinite++; }
+            lr[i][0] = left;
+            lr[i][1] = right;
+        }
+        /* Summing every bin goes past full scale (1.33 in the intro movies,
+         * 1.27 in a FlatOut 2 crash), and a hard clamp there is audible
+         * distortion. The limiter turns the gain down instead (tanh here
+         * used to bend the waveform itself: overdrive on loud effects). */
+        apu_limiter_run(&lim, &lr[0][0], NUM_SAMPLES_PER_FRAME, 1.0f);
 
-            /* Convert to 16-bit and write (not accumulate) into frame buffer.
-             * Each of the 8 sub-frames writes its own 32-sample slice. */
-            d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
-            d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
+        /* Convert to 16-bit and write (not accumulate) into frame buffer.
+         * Each of the 8 sub-frames writes its own 32-sample slice. */
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            d->monitor.frame_buf[off + i][0] = (int16_t)lrintf(lr[i][0] * 32767.0f);
+            d->monitor.frame_buf[off + i][1] = (int16_t)lrintf(lr[i][1] * 32767.0f);
         }
     }
 

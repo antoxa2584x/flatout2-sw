@@ -38,9 +38,20 @@ typedef struct {
 void xa2_get_stats(Xa2Stats *out);
 
 /* Master volume, 0.0 .. 1.0 (default 0.5), applied to every sample before
- * output, followed by a limiter that keeps the signal below -6 dBFS: nothing
+ * output, followed by a limiter (apu_limiter_run) that keeps the signal below -6 dBFS: nothing
  * the guest or the mixers produce can reach full scale in a headset. */
 void xa2_set_master_volume(float v);
+
+/* Stereo peak limiter (gain envelope, 64-sample look-ahead at 48 kHz).
+ * lr: interleaved stereo float, limited in place to +-ceiling. Zero-init a
+ * state before first use. */
+#define APU_LIMITER_LOOKAHEAD 64
+typedef struct {
+    float delay[APU_LIMITER_LOOKAHEAD][2];
+    float gain, target;
+    int pos, hold, init;
+} ApuLimiter;
+void apu_limiter_run(ApuLimiter *lim, float *lr, int frames, float ceiling);
 
 /* The same volume + limiter, for any other output path (waveOut). in and out
  * may be the same buffer. */

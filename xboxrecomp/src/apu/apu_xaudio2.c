@@ -12,19 +12,79 @@
 #include <math.h>
 #include "apu_xaudio2.h"
 
-/* Hearing safety, for every output path: master volume, then a soft limiter
- * whose output never exceeds -6 dBFS (16384). c * tanh(x / c) is linear for
- * quiet signals and bends smoothly towards the ceiling for loud ones, so a
- * spike (a mixdown summing many bins, a decoder glitch) is capped without the
- * harsh edge of hard clipping. */
+/* A stereo-linked peak limiter: it turns the gain down, never the waveform.
+ * Each sample asks for the gain that keeps it under the ceiling; the lowest
+ * ask is held while that sample crosses a 1.3 ms delay line and the applied
+ * gain glides down to it in that time, so the gain is already there when the
+ * peak comes out; then it recovers over ~120 ms. A final clamp catches the
+ * residue of the glide (under 1%).
+ *
+ * Both stages used to be tanh per sample. That is a waveshaper: fine for a
+ * stray spike, but a race sums to 1.27 x full scale for whole crashes, and
+ * two of them in series (mixdown, then volume 100 driving this one 2x into
+ * its ceiling) flattened FlatOut 2's crash sounds to a 4.6 dB crest factor --
+ * heard as overdrive. */
+void apu_limiter_run(ApuLimiter *lim, float *lr, int frames, float ceiling)
+{
+    const float att = 1.0f - expf(-5.0f / APU_LIMITER_LOOKAHEAD);
+    const float rel = 1.0f - expf(-1.0f / (0.120f * 48000.0f));
+    int i, c;
+
+    if (!lim->init) {
+        memset(lim, 0, sizeof *lim);
+        lim->gain = lim->target = 1.0f;
+        lim->init = 1;
+    }
+    for (i = 0; i < frames; i++) {
+        float *s = lr + i * 2, *d = lim->delay[lim->pos];
+        float pk = fabsf(s[0]) > fabsf(s[1]) ? fabsf(s[0]) : fabsf(s[1]);
+        float want = pk > ceiling ? ceiling / pk : 1.0f;
+        float out[2];
+
+        if (want <= lim->target) {
+            lim->target = want;
+            lim->hold = APU_LIMITER_LOOKAHEAD;
+        } else if (lim->hold > 0) {
+            lim->hold--;
+        } else {
+            lim->target += (1.0f - lim->target) * rel;
+        }
+        if (lim->target < lim->gain)
+            lim->gain += (lim->target - lim->gain) * att;
+        else
+            lim->gain = lim->target;
+
+        for (c = 0; c < 2; c++) {
+            float v = d[c] * lim->gain;
+            out[c] = v > ceiling ? ceiling : v < -ceiling ? -ceiling : v;
+            d[c] = s[c];
+            s[c] = out[c];
+        }
+        lim->pos = (lim->pos + 1) % APU_LIMITER_LOOKAHEAD;
+    }
+}
+
+/* Hearing safety, for every output path: master volume, then the limiter
+ * with its ceiling at -6 dBFS (16384), so nothing the guest or the mixers
+ * produce reaches full scale in a headset. Only one output path runs, so
+ * one limiter state serves them all. */
 static float g_xa2_volume = 0.5f;
 
 void apu_output_safety(const int16_t *in, int16_t *out, int n)
 {
-    const float ceiling = 16384.0f;
-    int i;
-    for (i = 0; i < n; i++)
-        out[i] = (int16_t)(ceiling * tanhf((float)in[i] * g_xa2_volume / ceiling));
+    static ApuLimiter lim;
+    float buf[512 * 2];
+    int done, k, i;
+
+    for (done = 0; done < n; done += k) {
+        k = n - done < (int)(sizeof buf / sizeof buf[0])
+          ? n - done : (int)(sizeof buf / sizeof buf[0]);
+        for (i = 0; i < k; i++)
+            buf[i] = (float)in[done + i] * g_xa2_volume;
+        apu_limiter_run(&lim, buf, k / 2, 16384.0f);
+        for (i = 0; i < k; i++)
+            out[done + i] = (int16_t)lrintf(buf[i]);
+    }
 }
 
 void xa2_set_master_volume(float v)

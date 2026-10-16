@@ -221,12 +221,29 @@ static void garbage_free(Frame *f)
     f->ngarbage = 0;
 }
 
+/* RECOMP_LAT_TRACE: the frame slot whose GPU completion is awaited, -1 none.
+ * Polled at flips and draws (a fence query), so "GPU done" is late by at
+ * most one draw. */
+static int s_lat_slot = -1;
+
+static void lat_poll(void)
+{
+    if (s_lat_slot >= 0 && vkGetFenceStatus(s_dev, s_fr[s_lat_slot].fence) == VK_SUCCESS) {
+        recomp_lat_gpu_done();
+        s_lat_slot = -1;
+    }
+}
+
 static void frame_begin(void)
 {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     s_f = &s_fr[s_fi];
     if (s_f->submitted) {
         vkWaitForFences(s_dev, 1, &s_f->fence, VK_TRUE, UINT64_MAX);
+        if (s_lat_slot == (int)s_fi) {
+            recomp_lat_gpu_done();
+            s_lat_slot = -1;
+        }
         vkResetFences(s_dev, 1, &s_f->fence);
         s_f->submitted = 0;
     }
@@ -1236,6 +1253,48 @@ static VkImageView cube_from_surfaces(uint32_t va, uint32_t w, uint32_t h, uint3
     return c->view;
 }
 
+/* The copy of a render target a draw into it samples (see vk_draw); one
+ * scratch image the size of that surface (sampled with its coordinates),
+ * refreshed once per surface write. */
+static VkImage s_snap_img;
+static VkImageView s_snap_view;
+static VkDeviceMemory s_snap_mem;
+static uint32_t s_snap_w, s_snap_h, s_snap_va, s_snap_gen, s_snap_cb = ~0u;
+
+static VkImageView self_snapshot(VkSurf *sf)
+{
+    VkImageCopy cp;
+    if (sf->pw != s_snap_w || sf->ph != s_snap_h) {
+        uint32_t w = sf->pw, h = sf->ph;
+        VkImage img; VkImageView view; VkDeviceMemory mem;
+        if (!make_image(w, h, VK_FORMAT_B8G8R8A8_UNORM,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &img, &view, &mem))
+            return sf->view;
+        if (s_snap_img)
+            garbage_add(s_snap_img, s_snap_view, s_snap_mem);
+        s_snap_img = img; s_snap_view = view; s_snap_mem = mem;
+        s_snap_w = w; s_snap_h = h;
+        s_snap_va = 0;
+    }
+    if (s_snap_va == sf->va && s_snap_gen == sf->gen && s_snap_cb == s_cb_gen)
+        return s_snap_view;
+    end_rendering();
+    barrier_all();
+    memset(&cp, 0, sizeof cp);
+    cp.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    cp.srcSubresource.layerCount = 1;
+    cp.dstSubresource = cp.srcSubresource;
+    cp.extent.width = sf->pw;
+    cp.extent.height = sf->ph;
+    cp.extent.depth = 1;
+    vkCmdCopyImage(s_cb, sf->image, VK_IMAGE_LAYOUT_GENERAL, s_snap_img,
+                   VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    barrier_all();
+    s_snap_va = sf->va; s_snap_gen = sf->gen; s_snap_cb = s_cb_gen;
+    return s_snap_view;
+}
+
 /* Samplers: wrap u, wrap v, mag, min, mipmapped. */
 typedef struct { uint32_t key; VkSampler s; } SamplerEnt;
 static SamplerEnt s_samplers[512];
@@ -1622,6 +1681,20 @@ static VkShaderModule compile(glslang_stage_t stage, const char *src)
     uint64_t hash = text_hash(src, (uint32_t)stage);
     const SpvEnt *hit = spv_find(hash, (uint32_t)stage);
 
+    {   /* RECOMP_VK_GLSL_DUMP=<dir>: every generated shader, <hash>.vs/.fs */
+        const char *d = getenv("RECOMP_VK_GLSL_DUMP");
+        if (d && *d) {
+            char path[512];
+            FILE *f;
+            snprintf(path, sizeof path, "%s/%016llx.%s", d, (unsigned long long)hash,
+                     stage == GLSLANG_STAGE_VERTEX ? "vs" : "fs");
+            if ((f = fopen(path, "w")) != NULL) {
+                fputs(src, f);
+                fclose(f);
+            }
+        }
+    }
+
     if (hit) {
         s_spv_hits++;
         ci.codeSize = (size_t)hit->nwords * 4;
@@ -1683,11 +1756,76 @@ typedef struct {
     uint32_t   prog[136][4];
 } ProgRec;
 
+/* Vertex attributes a program reads as packed CMP normals (type 6, fed as
+ * R32_UINT and unpacked in the shader, prog_cmp_glsl). Part of the program's
+ * key; stored in a record's xform word above bit 16. Programs only: fixed
+ * function converts them (upload_vertices). */
+static uint16_t s_prewarm_cmpm;
+
+static uint16_t prog_cmp_mask(const Nv2aRawBatch *b)
+{
+    uint16_t m = 0;
+    uint32_t a;
+    if (s_prewarming)
+        return s_prewarm_cmpm;
+    if (b->xform != 2)
+        return 0;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++)
+        if ((b->attr_direct & (1u << a)) && b->direct[a].type == 6)
+            m |= (uint16_t)(1u << a);
+    return m;
+}
+
+/* The program text with each CMP input read as a uint and unpacked into the
+ * vN the program uses: x, y 11-bit and z 10-bit signed, w 1 (as the
+ * executor's own fetch_attr). */
+static void prog_cmp_glsl(char *src, size_t cap, uint16_t m)
+{
+    static const char fn[] =
+        "vec4 nv2a_cmp(uint u) {\n"
+        "    return vec4(float(int(u << 21) >> 21) / 1023.0, float(int(u << 10) >> 21) / 1023.0,\n"
+        "                float(int(u) >> 22) / 511.0, 1.0);\n"
+        "}\n";
+    char from[64], to[96], init[512];
+    size_t ni = 0;
+    uint32_t a;
+    char *at;
+    init[0] = 0;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        size_t lf, lt, len;
+        if (!(m & (1u << a)))
+            continue;
+        snprintf(from, sizeof from, "layout(location = %u) in vec4 v%u;\n", a, a);
+        snprintf(to, sizeof to, "layout(location = %u) in uint v%u_cmp;\nvec4 v%u;\n", a, a, a);
+        if (!(at = strstr(src, from)))
+            continue;
+        lf = strlen(from); lt = strlen(to); len = strlen(src);
+        if (len + lt - lf + 1 > cap)
+            return;
+        memmove(at + lt, at + lf, len - (size_t)(at - src) - lf + 1);
+        memcpy(at, to, lt);
+        ni += (size_t)snprintf(init + ni, sizeof init - ni, "    v%u = nv2a_cmp(v%u_cmp);\n", a, a);
+    }
+    if (!ni || !(at = strstr(src, "void main() {\n")))
+        return;
+    {
+        size_t len = strlen(src), lfn = sizeof fn - 1, head = (size_t)(at - src);
+        size_t lm = strlen("void main() {\n");
+        if (len + lfn + ni + 1 > cap)
+            return;
+        /* the helper before main, the unpacking first thing in it */
+        memmove(at + lfn + lm + ni, at + lm, len - head - lm + 1);
+        memmove(at + lfn, at, lm);
+        memcpy(at, fn, lfn);
+        memcpy(at + lfn + lm, init, ni);
+    }
+}
+
 static void prog_rec_fill(ProgRec *rec, const Nv2aRawBatch *b, const Nv2aPshKey *pk)
 {
     memset(rec, 0, sizeof *rec);
     rec->magic = PROG_REC_MAGIC;
-    rec->xform = b->xform == 2 ? 2 : 1;
+    rec->xform = (b->xform == 2 ? 2u : 1u) | ((uint32_t)prog_cmp_mask(b) << 16);
     rec->pk = *pk;
     if (rec->xform == 2 && b->vp_program && b->vp_slots <= 136) {
         rec->vp_start = b->vp_start;
@@ -1714,7 +1852,8 @@ static void prog_rec_append(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
 static void prog_rec_batch(const ProgRec *rec, Nv2aRawBatch *bb, uint32_t n)
 {
     memset(bb, 0, sizeof *bb);
-    bb->xform = rec->xform;
+    bb->xform = rec->xform & 0xFFFFu;
+    s_prewarm_cmpm = (uint16_t)(rec->xform >> 16);
     bb->vp_program = (const uint32_t (*)[4])rec->prog;
     bb->vp_slots = rec->slots ? rec->slots : 136;
     bb->vp_start = rec->vp_start;
@@ -1733,12 +1872,18 @@ static VkProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
     int i;
     size_t n;
 
+    uint16_t cmpm = prog_cmp_mask(b);
+
     if (b->xform == 2) {
         if (b->vp_prog_gen != last_gen || !last_vkey) {
             last_vkey = prog_hash(b);
             last_gen = b->vp_prog_gen;
         }
         vkey = last_vkey;
+        if (cmpm) {
+            vkey ^= (uint64_t)cmpm * 0x9E3779B97F4A7C15ull;
+            if (!vkey) vkey = 1;
+        }
     }
     if (last && last->vs && last->vkey == vkey && !memcmp(&last->pkey, pk, sizeof *pk)) {
         last->used = s_frame;
@@ -1780,6 +1925,8 @@ static VkProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
             return NULL;
         n += (size_t)k;
         snprintf(vsrc + n, sizeof vsrc - n, "%s", nv2a_gl_vsh_main_program());
+        if (cmpm)
+            prog_cmp_glsl(vsrc, sizeof vsrc, cmpm);
     } else {
         snprintf(vsrc + n, sizeof vsrc - n, "%s", nv2a_gl_vsh_fixed());
     }
@@ -2704,6 +2851,7 @@ static uint32_t elem_bytes(uint32_t type, uint32_t size)
     case 0: return 4;
     case 2: return 4 * size;
     case 4: return size;
+    case 6: return 4;
     default: return 2 * size;
     }
 }
@@ -2777,6 +2925,7 @@ static VkFormat vertex_format(uint32_t type, uint32_t size)
     case 2: f = f_float[size]; break;
     case 4: f = f_unorm8[size]; break;
     case 5: f = f_sscaled16[size]; break;
+    case 6: f = size == 1 ? VK_FORMAT_R32_UINT : VK_FORMAT_UNDEFINED; break;   /* CMP */
     default: f = VK_FORMAT_UNDEFINED; break;
     }
     if (f != VK_FORMAT_UNDEFINED) {
@@ -2816,6 +2965,14 @@ static void attr_to_float4(const Nv2aRawBatch *b, uint32_t a, uint32_t v, float 
     case 4:
         for (c = 0; c < size && c < 4; c++) out[c] = p[c] / 255.0f;
         break;
+    case 6: {                                        /* CMP: 11:11:10 normal */
+        int32_t v;
+        memcpy(&v, p, 4);
+        out[0] = (float)((int32_t)((uint32_t)v << 21) >> 21) / 1023.0f;
+        out[1] = (float)((int32_t)((uint32_t)v << 10) >> 21) / 1023.0f;
+        out[2] = (float)(v >> 22) / 511.0f;
+        break;
+    }
     default:
         for (c = 0; c < size && c < 4; c++) { int16_t s; memcpy(&s, p + 2 * c, 2); out[c] = (float)s; }
         break;
@@ -2844,7 +3001,8 @@ static int upload_vertices(const Nv2aRawBatch *b)
         fmt[a] = VK_FORMAT_UNDEFINED;
         if (!(b->attr_direct & (1u << a)))
             continue;
-        fmt[a] = vertex_format(b->direct[a].type, b->direct[a].size);
+        fmt[a] = b->direct[a].type == 6 && b->xform != 2 ? VK_FORMAT_UNDEFINED
+               : vertex_format(b->direct[a].type, b->direct[a].size);
         if (fmt[a] != VK_FORMAT_UNDEFINED)
             direct |= (uint16_t)(1u << a);
         else
@@ -2983,6 +3141,8 @@ extern uint8_t *nv2a_pb_reg_dirty(void);
 static uint32_t s_regs_seen[0x2000 / 4];    /* registers as of the last draw */
 
 /* Did a register a draw depends on change since the last draw? */
+static int s_inst_why_on;
+static uint32_t s_reg_why[0x800];
 static int regs_changed(const uint32_t *r)
 {
     uint8_t *dirty = nv2a_pb_reg_dirty();
@@ -3003,6 +3163,8 @@ static int regs_changed(const uint32_t *r)
             if (m == 0x0100 || m == 0x17FC || (m >= 0x1800 && m < 0x1820)
              || m == 0x1D6C || m == 0x1D70 || m == 0x1E9C || m == 0x1EA4)
                 continue;                       /* NOP, BEGIN_END, draw data, semaphore, load slots */
+            if (s_inst_why_on)                  /* RECOMP_DRAW_STATS: which register */
+                s_reg_why[w & 0x7FF]++;
             changed = 1;
         }
     }
@@ -3025,6 +3187,7 @@ static struct {
     size_t       idx_cap;
 } s_pend;
 static int s_inst_on = -1, s_inst_alt;
+static uint32_t s_inst_why[9];          /* 0 appended or held, 1 regs, 2 full, 3 cb, 4 shape, 5 tex, 6 gen, 7 vertices, 8 other */
 static uint32_t s_st_draws, s_st_calls, s_st_inst;
 
 static void pend_flush(void)
@@ -3125,6 +3288,24 @@ static int pend_append(const Nv2aRawBatch *b, int changed)
 
     if (!s_pend.on)
         return 0;
+    if (s_inst_why_on) {            /* RECOMP_DRAW_STATS: why a draw was not appended */
+        uint32_t a, why = 0;
+        if (changed) why = 1;
+        else if (s_pend.count >= s_pend.max) why = 2;
+        else if (s_pend.cb_gen != s_cb_gen) why = 3;
+        else if (b->vertex_count != s_pend.vertex_count || b->index_count != s_pend.index_count
+                 || b->prim != s_pend.prim) why = 4;
+        else if (memcmp(b->tex_va, s_pend.tex_va, sizeof s_pend.tex_va)) why = 5;
+        else if (b->vp_prog_gen != s_pend.vp_prog_gen || b->attr_const_gen != s_pend.attr_const_gen
+                 || b->vtx_epoch != s_pend.vtx_epoch) why = 6;
+        else {
+            for (a = 0; a < NV2A_RAW_ATTRS; a++)
+                if ((b->attr_direct & (1u << a)) && b->direct[a].ptr != s_pend.direct[a].ptr)
+                    why = 7;
+            if (!why && !pend_matches(b)) why = 8;
+        }
+        s_inst_why[why]++;
+    }
     if (changed || s_pend.count >= s_pend.max || s_pend.cb_gen != s_cb_gen || !pend_matches(b))
         return 0;
     at = (s_f->ring_off + s_ubo_align - 1) & ~(s_ubo_align - 1);
@@ -3176,6 +3357,8 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         return;
     s_regs = r;
     s_batch = b;
+    if (s_lat_slot >= 0)
+        lat_poll();
     if (s_inst_on < 0) {
         const char *e = getenv("RECOMP_VK_INSTANCE");
         s_inst_on = !(e && *e == '0') && s_ubo_range >= VK_CONST_SIZE
@@ -3217,6 +3400,15 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     /* Textures first: uploads end the rendering pass. */
     for (i = 0; i < 4; i++)
         bind_stage(r, (int)i, tscale[i], &img[i], &sampled[i]);
+    /* A stage that samples the surface being drawn into (FlatOut 2's bloom
+     * composite reads the scene while it overwrites it) is a feedback loop
+     * in Vulkan: the GPU reads texels other fragments of the same draw are
+     * writing, and the result moved with the tiles -- a wavy shimmer over
+     * every bright car body. The NV2A reads what was there before the draw,
+     * so it samples a copy of that. */
+    for (i = 0; i < 4; i++)
+        if (sampled[i] && sampled[i] == s)
+            img[i].imageView = self_snapshot(s);
     for (i = 0; i < 4; i++)
         if (sampled[i] && sampled[i]->dirty && sampled[i] != s) {
             end_rendering();                 /* next begin_rendering barriers */
@@ -3924,6 +4116,7 @@ static void dump_fxaa(VkSurf *s, const char *path)
 
 static uint64_t s_guest_flip_ns;          /* last flip the title made (overlay below) */
 static int s_overlay_flip;                 /* vk_flip called for the overlay */
+static int s_burst;                        /* RECOMP_VK_DUMP_BURST frames left */
 
 /* The host's per-frame hook (switch_saltynx.c: the frame rate for SaltyNX
  * overlays), with the rendered picture's size. Weak and undefined
@@ -3955,11 +4148,36 @@ static void vk_flip(void)
         if (st < 0) {
             const char *e = getenv("RECOMP_DRAW_STATS");
             st = e && *e == '1';
+            s_inst_why_on = st;
         }
         if (st && s_frame - st_frame >= 300) {
             fprintf(stderr, "[vk] per frame: %u draws -> %u draw calls (%u instances appended)\n",
                     s_st_draws / (s_frame - st_frame), s_st_calls / (s_frame - st_frame),
                     s_st_inst / (s_frame - st_frame));
+            {
+                uint32_t k, nf = s_frame - st_frame;
+                fprintf(stderr, "[vk] not appended per frame: regs %u, full %u, cb %u, shape %u,"
+                        " textures %u, program/epoch %u, vertices %u, other %u\n",
+                        s_inst_why[1] / nf, s_inst_why[2] / nf, s_inst_why[3] / nf, s_inst_why[4] / nf,
+                        s_inst_why[5] / nf, s_inst_why[6] / nf, s_inst_why[7] / nf, s_inst_why[8] / nf);
+                for (k = 0; k < 9; k++) s_inst_why[k] = 0;
+                {
+                    uint32_t best[6] = {0}, w2, j;
+                    for (w2 = 0; w2 < 0x800; w2++)
+                        for (j = 0; j < 6; j++)
+                            if (!best[j] || s_reg_why[w2] > s_reg_why[best[j]]) {
+                                memmove(best + j + 1, best + j, (5 - j) * sizeof best[0]);
+                                best[j] = w2;
+                                break;
+                            }
+                    fprintf(stderr, "[vk] registers that broke a run:");
+                    for (j = 0; j < 6; j++)
+                        if (s_reg_why[best[j]])
+                            fprintf(stderr, " %04X x%u", best[j] * 4, s_reg_why[best[j]] / nf);
+                    fprintf(stderr, "\n");
+                    memset(s_reg_why, 0, sizeof s_reg_why);
+                }
+            }
             s_st_draws = s_st_calls = s_st_inst = 0;
             st_frame = s_frame;
         }
@@ -4033,7 +4251,18 @@ static void vk_flip(void)
             rescale_surfaces(k);
         }
     }
-    if (s && s_drew_any && dump_every && ((s_frame % (uint32_t)dump_every) == 0
+    {   /* RECOMP_VK_DUMP_BURST=<flag file>: once it exists, it is removed and
+         * the next 30 frames are all dumped (flicker between frames). */
+        static const char *burst_flag;
+        static int burst_init;
+        if (!burst_init) {
+            burst_init = 1;
+            burst_flag = getenv("RECOMP_VK_DUMP_BURST");
+        }
+        if (burst_flag && dump_every && !s_burst && remove(burst_flag) == 0)
+            s_burst = 30;
+    }
+    if (s && s_drew_any && dump_every && ((s_burst > 0 && s_burst--) || (s_frame % (uint32_t)dump_every) == 0
                                           || (s_inst_alt && s_frame % (uint32_t)dump_every == 1))) {
         char path[320];
         snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
@@ -4159,6 +4388,11 @@ static void vk_flip(void)
     if (vkQueueSubmit(s_queue, 1, &si, s_f->fence) != VK_SUCCESS)
         LOGE("vkQueueSubmit failed\n");
     s_f->submitted = 1;
+    if (recomp_lat_on()) {
+        lat_poll();
+        if (recomp_lat_flip())
+            s_lat_slot = (int)s_fi;
+    }
     if (have_image) {
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         VkResult pr;
@@ -4330,7 +4564,7 @@ static const Nv2aBackend s_backend = {
     vk_draw,
     vk_flip,
     vk_draw_raw,
-    NV2A_BACKEND_RAW_DIRECT,
+    NV2A_BACKEND_RAW_DIRECT | NV2A_BACKEND_RAW_CMP,
 };
 
 void nv2a_vk_install(void)

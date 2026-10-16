@@ -370,6 +370,28 @@ static inline uint16_t recomp_fxam(double value) {
  * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
  * and collapsing it to "equal" answers no every time. */
 #define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
+/* FPREM / FPREM1 in one step (the hardware may need several, saying so with
+ * C2): the remainder, and in *cc the status it leaves -- C2 clear for
+ * "complete", the quotient's low bits in C0 (q2), C3 (q1), C1 (q0), which
+ * sin/cos range reduction reads. The C library's fmod loops `fprem; fnstsw;
+ * sahf; jp` until C2 is clear, so a C2 left over from an unordered compare
+ * kept it spinning for good (a FlatOut 2 stunt froze loading). */
+static inline double recomp_fprem(double a, double b, int ieee, uint16_t *cc) {
+    double r = ieee ? remainder(a, b) : fmod(a, b);
+    uint16_t c = 0;
+    if (r == r && b == b && b != 0.0 && !isinf(a)) {
+        double q = fabs((a - r) / b);
+        unsigned qi = (unsigned)fmod(q < 0.5 ? 0.0 : floor(q + 0.5), 8.0);
+        c = (uint16_t)(((qi & 4u) ? 0x0100u : 0u) | ((qi & 2u) ? 0x4000u : 0u)
+                     | ((qi & 1u) ? 0x0200u : 0u));
+    }
+    *cc = c;
+    return r;
+}
+/* The compare state sahf would give for an FPREM status: CF = C0, ZF = C3,
+ * PF = C2 (always clear). Both C0 and C3 has no compare encoding; -1 keeps
+ * CF, which a jb/jae on the quotient bit wants more often than ZF. */
+#define RECOMP_FPREM_CMP(cc)  (((cc) & 0x0100u) ? -1 : ((cc) & 0x4000u) ? 0 : 1)
 /* x87 rounding to an integral value under the guest RC bits (control word
  * bits 10-11: 0 nearest-even, 1 down, 2 up, 3 toward zero). FRNDINT rounds
  * this way, and so does FIST before its store; neither may follow the HOST's

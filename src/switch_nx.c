@@ -296,9 +296,12 @@ static void perf_report(void)
         void mcpx_apu_ring_stats(uint32_t *stale, uint32_t *total);
         uint32_t st, tot;
         mcpx_apu_ring_stats(&st, &tot);
-        fprintf(stderr, "[perf] APU ring voices: %u of %u samples stale (%u.%02u%%)\n",
+        uint32_t mcpx_apu_nonfinite(void), mcpx_apu_stream_starved(void);
+        fprintf(stderr, "[perf] APU ring voices: %u of %u samples stale (%u.%02u%%);"
+                " %u non-finite mix samples silenced; %u stream frames starved\n",
                 st, tot, tot ? (unsigned)(100ull * st / tot) : 0,
-                tot ? (unsigned)(10000ull * st / tot % 100) : 0);
+                tot ? (unsigned)(10000ull * st / tot % 100) : 0, mcpx_apu_nonfinite(),
+                mcpx_apu_stream_starved());
     }
     last_frames = f;
     {

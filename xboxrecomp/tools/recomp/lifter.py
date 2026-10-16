@@ -559,12 +559,19 @@ def _make_condition(jcc, flag_setter, flag_ops):
         var = dict(flag_ops).get(_JCC_CANON.get(jcc, jcc))
         return (var, desc) if var else None
 
+    # The test is on _fa, the result every ZF_FROM_DEST setter snapshots
+    # where it computes it -- not on the register read back at the branch.
+    # Anything between may have replaced it: FlatOut 2's bit reader
+    # (0x1C63F0) joins `and ecx, 0x80000007` (jns taken) and `inc ecx`, then
+    # does `mov ecx, [ebx+8]; lea ecx, [ecx+eax]` before its jne. Reading ecx
+    # there tested a buffer pointer, never zero: every byte-aligned read took
+    # the unaligned path, and a stunt's recorded frames decoded to garbage
+    # (NaN physics, the game hung loading High Jump/Bowling).
     if flag_setter == "__zf_from_dest" and flag_ops:
-        dest = _fmt_operand_read(flag_ops[0])
         if jcc in ("je", "jz"):
-            return f"({dest} == 0)", desc
+            return "(_fa == 0)", desc
         if jcc in ("jne", "jnz"):
-            return f"({dest} != 0)", desc
+            return "(_fa != 0)", desc
         return None
 
     # A cmp/test that is not fused with its jcc snapshots its operands into
@@ -2177,10 +2184,19 @@ class Lifter:
         return [f"/* {m}: unhandled */"]
 
     def _lift_shift(self, insn, ops, c_op):
+        """shl/shr. The count is masked to 5 bits, as x86 does (see _lift_sar).
+
+        Unmasked, "shl eax, cl" with cl >= 32 is a C shift past the type's
+        width: undefined, and GCC may assume it never happens. FlatOut 2's
+        bitstream decoder computes (1 << bits) - 1 from a 7-bit field; a
+        stunt's recorded frames then decoded to a quaternion w of 511 and
+        the physics went NaN (the game hung loading High Jump/Bowling)."""
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
+        if not cnt[:1].isdigit():         # a literal count is already in range
+            cnt = f"(({cnt}) & 31u)"
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
@@ -3758,11 +3774,15 @@ class Lifter:
         if m == "f2xm1":
             return [f"fp_top() = exp2(fp_top()) - 1.0; /* f2xm1 */"]
         if m in ("fprem", "fprem1"):
-            # Both leave the remainder in st0 and clear C2 to say "complete".
+            # Both leave the remainder in st0 and clear C2 to say "complete"
+            # (recomp_fprem: done in one step, with the quotient bits).
             # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which
             # is the difference between fmod and remainder.
-            fn = "fmod" if m == "fprem" else "remainder"
-            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */"]
+            # The status matters as much as the value: fmod in the C library
+            # loops on C2 (sahf; jp), and the quotient bits steer sin/cos.
+            ieee = 0 if m == "fprem" else 1
+            return [f"{{ uint16_t _pcc; fp_top() = recomp_fprem(fp_top(), fp_st1(), {ieee}, &_pcc);"
+                    f" g_fp_cc = _pcc; g_fp_cmp = RECOMP_FPREM_CMP(_pcc); }} /* {m} */"]
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
         if m == "frndint":

@@ -32,3 +32,11 @@ NFSU2_MEM_MHZ=1600
 
 # Picture per mode is in fo2x_options.txt (scale_docked, scale_handheld,
 # aniso, fxaa). RECOMP_GL_SCALE=1.5 here would force one scale for both.
+
+# Frame rate: up to 60 fps (the title asks for 30). FO2_FPS_CAP=30 keeps 30.
+#FO2_FPS_CAP=30
+# Input latency: the game builds a frame only once the renderer has taken the
+# last one (one frame less lag, a little less overlap). FO2_LOW_LATENCY=0 off.
+#FO2_LOW_LATENCY=0
+# Diagnosing lag: one "[lat]" line per pad change (decode / submit / GPU ms).
+#RECOMP_LAT_TRACE=1

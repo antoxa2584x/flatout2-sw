@@ -12,6 +12,7 @@
  * pad plugged into the PC drives this one.
  */
 #include "usb_gamepad.h"
+#include "../kernel/nv2a_backend.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -548,7 +549,7 @@ int usb_gamepad_report(int dev, uint8_t *out, int max)
     if (xbox_InputGetState((DWORD)dev, &state) != 0) {
         out[2] = synth;
         pad_script(dev, out);
-        return 20;
+        goto done;
     }
 
     g = &state.Gamepad;
@@ -565,6 +566,14 @@ int usb_gamepad_report(int dev, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script(dev, out);
+done:
+    if (dev == 0) {                 /* RECOMP_LAT_TRACE: a change starts a measurement */
+        static uint8_t last[20];
+        if (memcmp(last + 2, out + 2, 18)) {
+            memcpy(last, out, 20);
+            recomp_lat_input();
+        }
+    }
     return 20;
 }
 

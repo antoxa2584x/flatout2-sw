@@ -150,6 +150,55 @@ commits as `Anton Artemov <antoxa2584@gmail.com>`).
 - Debug aids added: FRAME_TRACE prints texture formats/control0 per stage;
   `RECOMP_VK_SKIP_BLEND=<hex dfactor>` drops blended draws with that factor.
 
+- **Crash sounds overdriven (toolkit apu_dsp.c / apu_xaudio2.c, 2026-10-14):**
+  the mixdown (1.27 x full scale in a crash) went through tanh, then the
+  output "safety" tanh, driven 2x into its -6 dBFS ceiling at
+  RECOMP_AUDIO_VOLUME=100: crest factor 4.6 dB. Both are now one
+  gain-envelope limiter (apu_limiter_run, 64-sample look-ahead, 120 ms
+  release). Non-finite mix samples are silenced and counted ("non-finite mix
+  samples silenced" in the [perf] ring line; RECOMP_APU_RING_STATS=1 on Linux).
+- **Wavy shimmer on cars (toolkit nv2a_vk.c self_snapshot):** the bloom
+  composite samples the scene surface (stage 3) while drawing into it -- a
+  Vulkan feedback loop. A draw that samples its own target now samples a copy.
+- **Stunts hung loading (High Jump, Bowling) -- toolkit lifter:**
+  `__zf_from_dest` (a je/jne after a join of two ZF setters on one register)
+  re-read the register at the branch; the bit reader 0x1C63F0 rewrites ecx in
+  between, so every byte-aligned read took the unaligned path and the stunt's
+  recorded frames (0x8E-byte records, decoder 0x59910 / slerp 0x1C3BD0)
+  decoded to NaN: fmod's fprem loop, then the broad-phase, spun forever. Now
+  tests _fa (test_zf_merge_snapshot.py). Also fixed on the way: fprem/fprem1
+  set C2/quotient bits and the sahf state (test_fprem.py); shl/shr by cl mask
+  the count to 5 bits (test_shift_mask.py). Ten branches changed game-wide.
+- **Up to 60 fps:** the flip trap is NOP data (vblanks << 5) | 1 (method 1 of
+  the table at 0x243024, flip queue 0x242DF0); FlatOut 2 asks for 2
+  (0x10580141). The PGRAPH wrapper rewrites it to 1. FO2_FPS_CAP=30 keeps 30.
+  Menus 30 -> 58 fps on Linux.
+- **Input latency (recomp_manual.c, default on):** the frame-start fence wait
+  (0x1BEFD1 -> 0x23B890 -> 0x240240, frame fences at 0x42C3DC, write index
+  0x42C3E4) waits on the last frame's fence, not the one before:
+  first-frame-after-press decoded ~190 -> ~130 ms at 18 fps (lavapipe), race
+  20 -> 18 fps there. FO2_LOW_LATENCY=0 off. RECOMP_LAT_TRACE=1 logs "[lat]".
+- Debug aids: RECOMP_VK_GLSL_DUMP=<dir> (every shader), RECOMP_VK_DUMP_BURST=
+  <flag file> (next 30 frames dumped), Linux helpers /root/fo2x/stunt.sh,
+  retry.sh (N race retries), watchnan.sh <va> (gdb: first NaN written there).
+
+- **High Jump slow (toolkit, 2026-10-16):** 3243 draws/frame, 1756 with a
+  CMP normal (type 6, 11:11:10 packed) the executor converted on the CPU every
+  draw and could not instance. Now fed raw (NV2A_BACKEND_RAW_CMP; R32_UINT,
+  unpacked in the vertex shader -- prog_cmp_glsl, mask in the program key and
+  in progcache records' xform >> 16). Instanced 184 -> 975, 3058 -> 2267 draw
+  calls, lavapipe 11 -> 13.5 fps. Next: 482 runs/frame broken by
+  COMBINER_FACTOR0 (0x0A60, per-object tint) -- would need per-instance
+  combiner constants. RECOMP_DRAW_STATS=1 prints why draws were not merged
+  and which registers broke runs; FRAME_TRACE prints attribute formats.
+- **Pops (toolkit apu_vp.c):** pops in the output sat on APU frame boundaries
+  at one phase of every 256-sample block (FMOD's register writes land at the
+  same sub-frame: the frame thread renders 8 frames per wait). Voice volume
+  changes were applied as steps; mix gains now glide (RECOMP_APU_VOL_RAMP,
+  default 8 frames): High Jump 11.7 -> 2.4 pops/min. RECOMP_APU_RING_STATS=1
+  also reports stream starvation, ADPCM ring staleness (RING_TRACK_MAX 64 K),
+  and frame-boundary jumps per voice / per bin. Linux helper hjpop.sh <tag>.
+
 ## Status (2026-10-13)
 
 - Linux Vulkan (lavapipe): intro movies, title, profile create/save/load,
